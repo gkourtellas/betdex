@@ -1,0 +1,18 @@
+services:
+  trading-bot:
+    build: .
+    container_name: betdex_trading_bot
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      - LOG_DIR=/app/logs
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./logs:/app/logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
