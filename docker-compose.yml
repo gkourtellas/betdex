@@ -16,3 +16,20 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  dashboard:
+    build: .
+    container_name: betdex_dashboard
+    restart: "no"
+    command: ["python", "-u", "src/dashboard.py"]
+    ports:
+      - "8051:8051"
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

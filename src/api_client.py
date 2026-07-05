@@ -1,5 +1,11 @@
 """BetDEX REST API client and optional Telegram alerts.
 
+Real order body confirmed from BetDEX docs — there is NO "side" field.
+Side comes from which outcome you pick + the price. Unmatched stake
+behavior is controlled by matchBehavior:
+  RetainUnmatched  -> stays open as a live offer (default, what we want)
+  CancelUnmatched  -> gets cancelled if not matched right away
+
 Docs: https://developers.betdex.com/
 """
 
@@ -42,7 +48,7 @@ class BetdexClient:
             return False
 
     def ensure_valid_session(self):
-        """Re-login if no token, or token close to its ~30 min expiry."""
+        """Re-login if no token, or token close to its expiry."""
         if not self.access_token or not self.access_expires_at:
             return self.login()
         try:
@@ -53,18 +59,20 @@ class BetdexClient:
             return self.login()
         return True
 
-    def get_markets(self, market_type_ids, from_datetime, statuses="Open", published=True, size=100, page=0, sort="lockAt,asc"):
-        """GET /markets — list markets, filtered and paginated."""
+    def get_markets(self, market_type_id, from_datetime, statuses="Open", published=True, size=100, page=0):
+        """GET /markets — list markets of one type, filtered and paginated.
+        Returns the raw response dict (has "markets", "_meta", etc) or None.
+        """
         self.ensure_valid_session()
         url = f"{self.base_url}/markets"
         params = {
-            "marketTypeIds": market_type_ids,
+            "marketTypeIds": market_type_id,
             "fromDateTime": from_datetime,
             "statuses": statuses,
             "published": str(published).lower(),
             "size": size,
             "page": page,
-            "sort": sort,
+            "sort": "lockAt,asc",
         }
         try:
             response = requests.get(url, params=params, headers=self.headers)
@@ -79,7 +87,7 @@ class BetdexClient:
             return None
 
     def get_market_by_id(self, market_id):
-        """GET /markets/{id} — full market detail including outcome titles."""
+        """GET /markets/{id} — full market detail: outcomes, event, league, teams."""
         self.ensure_valid_session()
         url = f"{self.base_url}/markets/{market_id}"
         try:
@@ -95,7 +103,10 @@ class BetdexClient:
             return None
 
     def get_market_prices(self, market_id):
-        """GET /market-prices — current back/lay price ladder for a market."""
+        """GET /market-prices — price ladder for one market.
+        Each entry in "prices" has: side ("For"/"Against"), outcomeId,
+        price (odds), amount (size available at that price), matched.
+        """
         self.ensure_valid_session()
         url = f"{self.base_url}/market-prices"
         try:
@@ -110,36 +121,26 @@ class BetdexClient:
             print(f"Error fetching prices for market {market_id}: {str(e)}")
             return None
 
-    def get_event(self, event_id):
-        """GET /events — event, league, and team names for one event id."""
-        self.ensure_valid_session()
-        url = f"{self.base_url}/events"
-        try:
-            response = requests.get(url, params={"ids": event_id}, headers=self.headers)
-            if response.status_code == 401:
-                if self.login():
-                    response = requests.get(url, params={"ids": event_id}, headers=self.headers)
-            if response.status_code == 200:
-                return response.json()
-            return None
-        except Exception as e:
-            print(f"Error fetching event {event_id}: {str(e)}")
-            return None
+    def submit_order(self, market_id, outcome_id, price, stake,
+                      keep_when_in_play=False, match_behavior="RetainUnmatched", reference=None):
+        """POST /orders — place one order.
 
-    def submit_order(self, market_id, outcome_id, side, price, stake,
-                      keep_when_in_play=False, match_behavior="CancelUnmatched"):
-        """POST /orders — place a single order. side is 'For' or 'Against'."""
+        Backing an outcome = betting "For" that outcome at this price.
+        match_behavior "RetainUnmatched" keeps any unmatched part of the
+        stake open as a live offer instead of cancelling it — use this,
+        not "CancelUnmatched", or your bets vanish immediately.
+        """
         self.ensure_valid_session()
         url = f"{self.base_url}/orders"
         payload = {
             "walletId": self.wallet_id,
             "marketId": str(market_id),
             "outcomeId": str(outcome_id),
-            "side": side,
             "price": price,
             "stake": stake,
             "keepWhenInPlay": keep_when_in_play,
             "matchBehavior": match_behavior,
+            "reference": reference or "",
         }
         try:
             response = requests.post(url, data=json.dumps(payload), headers=self.headers)
@@ -155,7 +156,10 @@ class BetdexClient:
             return None
 
     def get_orders(self, order_ids=None, market_ids=None):
-        """GET /orders — filter by orderIds or marketIds. Always scoped to this wallet."""
+        """GET /orders — filter by orderIds or marketIds, scoped to this wallet.
+        Response includes "orders", "markets" (with settledAt), and "trades"
+        (with profitLoss) — use these three together to work out win/lose.
+        """
         self.ensure_valid_session()
         url = f"{self.base_url}/orders"
         params = {"walletIds": self.wallet_id}
@@ -176,7 +180,6 @@ class BetdexClient:
             return None
 
     def send_telegram(self, message):
-        """Same Telegram alert helper as the matchbook bot."""
         if not self.tg_token or not self.tg_chat_id:
             return
         url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
