@@ -1,0 +1,20 @@
+{
+  "current_step": 1,
+  "active_bets": [
+    {
+      "order_id": "218696866",
+      "market_id": "837125",
+      "event_id": "38502",
+      "lock_at": "2026-07-05T19:00:00",
+      "placed_at": "2026-07-05T18:18:09.707839",
+      "selection_name": "CA Fenix Montevideo",
+      "event_name": "CA Fenix Montevideo v Huracan FC",
+      "league": "Uruguay Segunda Division",
+      "stake": 1.0,
+      "price": 1.01,
+      "step": 1,
+      "record_id": 2
+    }
+  ],
+  "balance": 1.0
+}

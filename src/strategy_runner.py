@@ -1,16 +1,10 @@
 """Runs one strategy's scan -> bet -> wait -> settle -> repeat loop.
 
-Each strategy gets one of these, running on its own, side by side with
-every other strategy. They don't affect each other.
-
-Supports:
-- normal ladder strategies (staking_plan steps up on loss, resets on win)
-- compound strategies (stake = whole balance, balance compounds on win,
-  strategy disables itself on loss or when target balance is reached)
-- multi_market strategies (scan more than one market_type_id per pass)
-- live_mode: "pre" (pre-match only), "live" (in-play only), "both"
-
-Does NOT include cash-out or lay-side betting yet.
+Timing note: BetDEX's "lockAt" field is when betting closes, NOT when
+the match kicks off — on some markets that's 2+ hours after real
+kickoff. All pre-match window/timing checks use the event's real
+"expectedStartTime" instead. lockAt is only used for cooldown timing
+after a bet is placed.
 """
 
 import asyncio
@@ -86,6 +80,15 @@ class StrategyRunner:
             return is_live
         return True  # both
 
+    @staticmethod
+    def _parse_iso(value):
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+        except Exception:
+            return None
+
     async def run(self):
         self.log(f"Starting. Configs: {len(self.market_configs)}, mode: {self.strategy_mode}, "
                   f"type: {self.strategy_type}")
@@ -105,6 +108,12 @@ class StrategyRunner:
         now = datetime.utcnow()
         horizon = now + timedelta(minutes=self.lookahead_minutes)
         from_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        # Rough cutoff for skipping obviously-too-far-away markets without
+        # fetching detail for all 100 of them. lockAt can trail the real
+        # kickoff by a few hours, so this buffer is generous on purpose —
+        # the real, precise check happens below using expectedStartTime.
+        rough_cutoff = horizon + timedelta(hours=6)
 
         for market_cfg in self.market_configs:
             market_type_id = market_cfg["market_type_id"]
@@ -129,27 +138,38 @@ class StrategyRunner:
                 if not self._market_passes_live_filter(market):
                     continue
 
-                lock_at_str = market.get("lockAt")
-                if not lock_at_str:
+                lock_at = self._parse_iso(market.get("lockAt"))
+                if lock_at and lock_at > rough_cutoff:
+                    continue  # far enough away that real kickoff can't be in range either
+
+                market_id = market["id"]
+
+                # Need the real kickoff time (expectedStartTime), which
+                # only comes from the market detail call, not the list.
+                detail = await asyncio.to_thread(self.client.get_market_by_id, market_id)
+                if not detail:
                     continue
-                try:
-                    lock_at = datetime.strptime(lock_at_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-                except Exception:
+                market_detail = detail.get("markets", [{}])[0]
+
+                event_id = None
+                start_time = None
+                for ev in detail.get("events", []):
+                    event_id = ev.get("id")
+                    start_time = self._parse_iso(ev.get("expectedStartTime"))
+
+                if not start_time:
                     continue
 
                 is_live = market.get("inPlayStatus") == "InPlay"
                 if not is_live:
-                    if lock_at <= now or lock_at > horizon:
+                    if start_time <= now or start_time > horizon:
                         continue
-                    if (lock_at - now).total_seconds() < self.min_seconds_to_start:
+                    if (start_time - now).total_seconds() < self.min_seconds_to_start:
                         continue
 
-                event_id = (market.get("event") or {}).get("_ids", [None])[0]
                 already_bet = any(b.get("event_id") == event_id for b in self.active_bets)
                 if already_bet:
                     continue
-
-                market_id = market["id"]
 
                 prices_data = await asyncio.to_thread(self.client.get_market_prices, market_id)
                 if not prices_data or not prices_data.get("prices"):
@@ -157,11 +177,6 @@ class StrategyRunner:
                 prices_entry = prices_data["prices"][0]
                 if not prices_entry.get("prices"):
                     continue
-
-                detail = await asyncio.to_thread(self.client.get_market_by_id, market_id)
-                if not detail:
-                    continue
-                market_detail = detail.get("markets", [{}])[0]
 
                 # market_detail["marketOutcomes"] is only a ref pointer
                 # ({"_ref":..,"_ids":[...]}) — the real outcome objects
@@ -175,6 +190,16 @@ class StrategyRunner:
                     continue
 
                 outcome_id, outcome_title, price = found
+
+                # Re-check price right before betting — earlier steps
+                # (detail fetch) take time, and price can move in that gap.
+                fresh_prices_data = await asyncio.to_thread(self.client.get_market_prices, market_id)
+                if fresh_prices_data and fresh_prices_data.get("prices"):
+                    fresh_entry = fresh_prices_data["prices"][0]
+                    fresh_found = matcher.find_opportunity(outcomes, fresh_entry, market_cfg)
+                    if fresh_found:
+                        outcome_id, outcome_title, price = fresh_found
+
                 stake = self.stake_for_step()
 
                 event_name = "Unknown Match"
@@ -189,6 +214,7 @@ class StrategyRunner:
                 order_result = await asyncio.to_thread(
                     self.client.submit_order,
                     market_id, outcome_id, price, stake,
+                    side="For",
                     keep_when_in_play=(self.live_mode != "pre"),
                     match_behavior="RetainUnmatched",
                 )
@@ -204,7 +230,7 @@ class StrategyRunner:
                     "order_id": placed_order.get("id"),
                     "market_id": market_id,
                     "event_id": event_id,
-                    "lock_at": lock_at,
+                    "lock_at": lock_at or start_time,
                     "placed_at": datetime.utcnow(),
                     "selection_name": outcome_title,
                     "event_name": event_name,

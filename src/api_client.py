@@ -1,8 +1,8 @@
 """BetDEX REST API client and optional Telegram alerts.
 
-Real order body confirmed from BetDEX docs — there is NO "side" field.
-Side comes from which outcome you pick + the price. Unmatched stake
-behavior is controlled by matchBehavior:
+Real order body confirmed working: needs a "side" field ("For" = back,
+"Against" = lay) — API rejects the order with "side must not be null"
+if it's missing. Unmatched stake behavior is controlled by matchBehavior:
   RetainUnmatched  -> stays open as a live offer (default, what we want)
   CancelUnmatched  -> gets cancelled if not matched right away
 
@@ -10,6 +10,7 @@ Docs: https://developers.betdex.com/
 """
 
 import os
+import uuid
 import requests
 import json
 from datetime import datetime, timedelta
@@ -121,11 +122,14 @@ class BetdexClient:
             print(f"Error fetching prices for market {market_id}: {str(e)}")
             return None
 
-    def submit_order(self, market_id, outcome_id, price, stake,
+    def submit_order(self, market_id, outcome_id, price, stake, side="For",
                       keep_when_in_play=False, match_behavior="RetainUnmatched", reference=None):
         """POST /orders — place one order.
 
-        Backing an outcome = betting "For" that outcome at this price.
+        side must be "For" (back) or "Against" (lay) — the API rejects
+        the order with a 400 "side must not be null" error if this is
+        left out. Backing an outcome = "For".
+
         match_behavior "RetainUnmatched" keeps any unmatched part of the
         stake open as a live offer instead of cancelling it — use this,
         not "CancelUnmatched", or your bets vanish immediately.
@@ -136,11 +140,12 @@ class BetdexClient:
             "walletId": self.wallet_id,
             "marketId": str(market_id),
             "outcomeId": str(outcome_id),
+            "side": side,
             "price": price,
             "stake": stake,
             "keepWhenInPlay": keep_when_in_play,
             "matchBehavior": match_behavior,
-            "reference": reference or "",
+            "reference": reference or str(uuid.uuid4()),
         }
         try:
             response = requests.post(url, data=json.dumps(payload), headers=self.headers)

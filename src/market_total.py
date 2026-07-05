@@ -1,6 +1,9 @@
 """Finds a betting opportunity in an Over/Under Total Goals market
 (BetDEX marketType e.g. FOOTBALL_OVER_UNDER_TOTAL_GOALS).
 
+Confirmed against real site data: site "Back" column = API side
+"Against". Backing an outcome means reading the "Against" price list.
+
 On BetDEX each goal line is its OWN market (marketValue = "2.5", "3.5",
 etc), with exactly two outcomes: "Over" and "Under". So this only needs
 to check the one outcome matching the strategy's chosen direction.
@@ -28,10 +31,10 @@ def find_opportunity(outcomes, prices_entry, strategy):
             continue
 
         outcome_id = outcome.get("id")
-        candidates = [p for p in prices_list if p.get("side") == "For" and p.get("outcomeId") == outcome_id]
+        candidates = [p for p in prices_list if p.get("side") == "Against" and p.get("outcomeId") == outcome_id]
         if not candidates:
             return None
-        best = min(candidates, key=lambda p: p.get("price", float("inf")))
+        best = max(candidates, key=lambda p: p.get("price", 0))
         price = best.get("price")
         amount = best.get("amount")
 

@@ -1,18 +1,19 @@
 """Finds a betting opportunity in a 'Full Time Result' / moneyline style
 market (BetDEX marketType e.g. FOOTBALL_FULL_TIME_RESULT).
 
-Looks at every outcome (Home / Draw / Away), finds the best "For" (back)
-price for each, and returns the first one that falls in the strategy's
-odds range with enough liquidity.
+Confirmed against real site data: site "Back" column = API side
+"Against". Site "Lay" column = API side "For". Backing an outcome
+means reading the "Against" price list, not "For".
 """
 
 
 def _best_for_price(prices_list, outcome_id):
-    """Best back price for one outcome = lowest 'For' price on offer."""
-    candidates = [p for p in prices_list if p.get("side") == "For" and p.get("outcomeId") == outcome_id]
+    """Best price to back at = highest 'Against' price on offer.
+    Order itself is still placed with side='For'."""
+    candidates = [p for p in prices_list if p.get("side") == "Against" and p.get("outcomeId") == outcome_id]
     if not candidates:
         return None, None
-    best = min(candidates, key=lambda p: p.get("price", float("inf")))
+    best = max(candidates, key=lambda p: p.get("price", 0))
     return best.get("price"), best.get("amount")
 
 

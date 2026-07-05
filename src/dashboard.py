@@ -8,7 +8,7 @@ Then open http://localhost:8051 in your browser.
 import os
 import json
 import shutil
-import subprocess
+import docker
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string, request
 
@@ -91,14 +91,18 @@ def save_strategies_file(strategies):
 
 
 def restart_bot_container():
+    """Restarts the trading bot container by talking to the docker
+    socket directly (python 'docker' package), instead of shelling out
+    to a 'docker' CLI binary — that binary isn't guaranteed to be
+    present even when the docker.io apt package is installed.
+    """
     try:
-        result = subprocess.run(
-            ["docker", "restart", "betdex_trading_bot"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            return True, "Bot restarted."
-        return False, f"Restart failed: {result.stderr.strip()}"
+        client = docker.from_env()
+        container = client.containers.get("betdex_trading_bot")
+        container.restart()
+        return True, "Bot restarted."
+    except docker.errors.NotFound:
+        return False, "Container 'betdex_trading_bot' not found."
     except Exception as e:
         return False, f"Could not restart bot: {e}"
 
@@ -148,6 +152,7 @@ PAGE = """
   .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
   .error-box { background: rgba(255,107,94,0.12); border: 1px solid var(--loss); color: var(--loss); padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; display: none; }
   .market-row { background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; position: relative; }
+  .saving-banner { display: none; background: rgba(245,185,66,0.12); border: 1px solid var(--pending, #f5b942); color: #f5b942; padding: 10px 14px; border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 13px; margin-bottom: 16px; }
 </style>
 </head>
 <body>
@@ -157,6 +162,7 @@ PAGE = """
   </div>
 
   <h1>Strategies</h1>
+  <div class="saving-banner" id="restartBanner">Restarting the bot…</div>
   <div id="strategyList"></div>
   <button class="add-btn" onclick="openModal(null)">+ Add strategy</button>
 
@@ -491,10 +497,17 @@ function persist() {
 }
 
 function restartBot() {
+  document.getElementById('restartBanner').style.display = 'block';
   fetch('/api/restart_bot', { method: 'POST' })
     .then(r => r.json())
-    .then(result => alert(result.restarted ? 'Bot restarted.' : ('Restart failed: ' + result.message)))
-    .catch(err => alert('Restart failed: ' + err));
+    .then(result => {
+      document.getElementById('restartBanner').style.display = 'none';
+      alert(result.restarted ? 'Bot restarted.' : ('Restart failed: ' + result.message));
+    })
+    .catch(err => {
+      document.getElementById('restartBanner').style.display = 'none';
+      alert('Restart failed: ' + err);
+    });
 }
 
 fetchStrategies();
