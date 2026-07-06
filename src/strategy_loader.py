@@ -15,9 +15,12 @@ strategies_file_lock = asyncio.Lock()
 
 
 async def disable_strategy(name, reason):
-    """Sets enabled: false for one strategy in strategies.json. Does not
-    auto re-enable it — you turn it back on by hand in the dashboard
-    or the json file.
+    """
+    Sets 'enabled' to False for a specific strategy in the configuration file.
+
+    Args:
+        name (str): The name of the strategy to disable.
+        reason (str): The reason for disabling (used for logging).
     """
     async with strategies_file_lock:
         with open(STRATEGIES_FILE, encoding="utf-8") as f:
@@ -54,9 +57,15 @@ def _validate_market_config(strat_name, cfg):
 
 
 def load_strategies():
-    """Returns the list of enabled, valid strategies from strategies.json.
-    A strategy with a problem is skipped with a warning — it does not
-    stop the other strategies from running.
+    """
+    Reads strategies from strategies.json and filters for enabled and valid ones.
+
+    Returns:
+        list: A list of validated strategy configuration dictionaries.
+
+    Raises:
+        FileNotFoundError: If strategies.json is missing.
+        ValueError: If multiple enabled strategies have the same name.
     """
     if not os.path.isfile(STRATEGIES_FILE):
         raise FileNotFoundError(f"Missing config: {STRATEGIES_FILE}")

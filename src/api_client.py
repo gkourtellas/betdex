@@ -30,7 +30,10 @@ class BetdexClient:
         self.headers = {"content-type": "application/json"}
 
     def login(self):
-        """Creates a session using appId, walletId and apiKey. Stores accessToken."""
+        """
+        Creates a session using appId, walletId and apiKey. Stores accessToken.
+        Returns True if successful, False otherwise.
+        """
         url = f"{self.base_url}/sessions"
         payload = {"appId": self.app_id, "walletId": self.wallet_id, "apiKey": self.api_key}
         try:
@@ -49,7 +52,10 @@ class BetdexClient:
             return False
 
     def ensure_valid_session(self):
-        """Re-login if no token, or token close to its expiry."""
+        """
+        Ensures a valid session token exists. Re-logins if no token exists
+         or if the token is within 2 minutes of expiry.
+        """
         if not self.access_token or not self.access_expires_at:
             return self.login()
         try:
@@ -61,8 +67,19 @@ class BetdexClient:
         return True
 
     def get_markets(self, market_type_id, from_datetime, statuses="Open", published=True, size=100, page=0):
-        """GET /markets — list markets of one type, filtered and paginated.
-        Returns the raw response dict (has "markets", "_meta", etc) or None.
+        """
+        GET /markets — list markets of one type, filtered and paginated.
+
+        Args:
+            market_type_id (str): The ID of the market type (e.g., 'FOOTBALL_FULL_TIME_RESULT').
+            from_datetime (str): ISO 8601 formatted datetime string.
+            statuses (str): Filter by market status.
+            published (bool): Filter by publication status.
+            size (int): Number of items per page.
+            page (int): Page number.
+
+        Returns:
+            dict: The raw response dictionary containing 'markets', '_meta', etc., or None on error.
         """
         self.ensure_valid_session()
         url = f"{self.base_url}/markets"

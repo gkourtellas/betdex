@@ -90,6 +90,10 @@ class StrategyRunner:
             return None
 
     async def run(self):
+        """
+        Starts the strategy's main loop. Continually scans for betting
+        opportunities and checks for settlements of active bets.
+        """
         self.log(f"Starting. Configs: {len(self.market_configs)}, mode: {self.strategy_mode}, "
                   f"type: {self.strategy_type}")
         while True:
@@ -105,6 +109,11 @@ class StrategyRunner:
             await asyncio.sleep(self.poll_interval if not self.active_bets else 30)
 
     async def scan_and_bet(self):
+        """
+        Scans all configured market types for betting opportunities.
+        If a match is found that passes all strategy filters, an order is placed.
+        One bet per scan pass is the current limit.
+        """
         now = datetime.utcnow()
         horizon = now + timedelta(minutes=self.lookahead_minutes)
         from_iso = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -262,6 +271,10 @@ class StrategyRunner:
         self.log("Scan done: nothing matched the strategy right now.")
 
     async def check_settlements(self):
+        """
+        Checks the status of all active bets. If a bet's market is settled,
+        the strategy's state (current step or balance) is updated accordingly.
+        """
         if not self.active_bets:
             return
 
