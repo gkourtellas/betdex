@@ -1,20 +1,5 @@
 {
-  "current_step": 1,
-  "active_bets": [
-    {
-      "order_id": "218685913",
-      "market_id": "837233",
-      "event_id": "38507",
-      "lock_at": "2026-07-05T21:00:00",
-      "placed_at": "2026-07-05T18:05:49.430156",
-      "selection_name": "Nublense",
-      "event_name": "Nublense v Curico Unido",
-      "league": "Copa Chile",
-      "stake": 0.1,
-      "price": 1.61,
-      "step": 1,
-      "record_id": 1
-    }
-  ],
+  "current_step": 2,
+  "active_bets": [],
   "balance": null
 }

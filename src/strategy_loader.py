@@ -47,9 +47,12 @@ def _validate_market_config(strat_name, cfg):
     if not market_type_id:
         raise ValueError(f"Strategy '{strat_name}': missing market_type_id.")
     if "OVER_UNDER" in market_type_id:
-        if not cfg.get("total_range") or not cfg.get("total_direction"):
+        has_exact_line = cfg.get("total_range") and cfg.get("total_direction")
+        has_range_line = cfg.get("total_range_min") is not None and cfg.get("total_range_max") is not None and cfg.get("total_direction")
+        if not has_exact_line and not has_range_line:
             raise ValueError(
-                f"Strategy '{strat_name}': Over/Under market needs total_range and total_direction."
+                f"Strategy '{strat_name}': Over/Under market needs total_direction, "
+                f"plus either total_range (exact line) or total_range_min/total_range_max (a range)."
             )
 
 

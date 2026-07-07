@@ -42,7 +42,7 @@
       "live_mode": "pre",
       "market_configs": null,
       "market_type_id": "FOOTBALL_OVER_UNDER_TOTAL_GOALS",
-      "max_back_odds": 1.7,
+      "max_back_odds": 1.8,
       "max_open_bets": 1,
       "min_back_odds": 1.45,
       "min_seconds_to_start": 300,
@@ -112,39 +112,6 @@
       "strategy_type": "compound",
       "total_direction": null,
       "total_range": null
-    },
-    {
-      "name": "Corners",
-      "strategy_mode": "single",
-      "strategy_type": "normal",
-      "staking_plan": [
-        0.1,
-        0.3,
-        0.9,
-        2.7,
-        8.1,
-        24.3
-      ],
-      "staking_steps": 6,
-      "compound_start": null,
-      "compound_target": null,
-      "live_mode": "pre",
-      "max_open_bets": 1,
-      "poll_interval_seconds": 600,
-      "open_positions_cooldown_seconds": 600,
-      "event_lookahead_minutes": 180,
-      "min_seconds_to_start": 300,
-      "minimum_liquidity": 2,
-      "keep_in_play": false,
-      "enabled": true,
-      "market_configs": null,
-      "market_type_id": "FOOTBALL_CORNERS_OVER_UNDER",
-      "min_back_odds": 1.45,
-      "max_back_odds": 1.6,
-      "total_range": null,
-      "total_range_min": 8.5,
-      "total_range_max": 10.5,
-      "total_direction": "Over"
     }
   ]
 }

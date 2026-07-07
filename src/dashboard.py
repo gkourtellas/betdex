@@ -8,11 +8,13 @@ Then open http://localhost:8051 in your browser.
 import os
 import json
 import shutil
+import sqlite3
 import docker
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string, request
 
 STRATEGIES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "strategies.json")
+DB_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "bets.db")
 
 app = Flask(__name__)
 
@@ -45,8 +47,11 @@ def _validate_one(s):
             return f"'{s['name']}': missing market_type_id."
         if s.get("min_back_odds", 0) > s.get("max_back_odds", 0):
             return f"'{s['name']}': min_back_odds is greater than max_back_odds."
-        if "OVER_UNDER" in s["market_type_id"] and not (s.get("total_range") and s.get("total_direction")):
-            return f"'{s['name']}': Over/Under market needs total_range and total_direction."
+        if "OVER_UNDER" in s["market_type_id"]:
+            has_exact = s.get("total_range") and s.get("total_direction")
+            has_range = s.get("total_range_min") is not None and s.get("total_range_max") is not None and s.get("total_direction")
+            if not has_exact and not has_range:
+                return f"'{s['name']}': Over/Under market needs total_direction, plus an exact line or a min/max range."
 
     if s.get("strategy_type") == "compound":
         if not s.get("compound_start") or not s.get("compound_target"):
@@ -107,6 +112,66 @@ def restart_bot_container():
         return False, f"Could not restart bot: {e}"
 
 
+def _connect_db():
+    if not os.path.isfile(DB_PATH):
+        return None
+    return sqlite3.connect(DB_PATH)
+
+
+def get_stats():
+    """Per-strategy totals + a running balance-over-time series, built
+    from every settled bet in config/bets.db.
+    """
+    conn = _connect_db()
+    if conn is None:
+        return {"strategies": [], "timeline": []}
+
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT strategy_name, event_name, selection_name, price, stake,
+                  result, profit, settled_at
+           FROM bets
+           WHERE result IS NOT NULL
+           ORDER BY settled_at ASC"""
+    ).fetchall()
+    conn.close()
+
+    per_strategy = {}
+    timeline = []
+    running_total = 0.0
+
+    for r in rows:
+        name = r["strategy_name"]
+        s = per_strategy.setdefault(name, {
+            "name": name, "bets": 0, "wins": 0, "losses": 0, "profit": 0.0
+        })
+        s["bets"] += 1
+        if r["result"] == "won":
+            s["wins"] += 1
+        else:
+            s["losses"] += 1
+        profit = r["profit"] or 0.0
+        s["profit"] = round(s["profit"] + profit, 4)
+
+        running_total = round(running_total + profit, 4)
+        timeline.append({
+            "settled_at": r["settled_at"],
+            "strategy_name": name,
+            "event_name": r["event_name"],
+            "result": r["result"],
+            "profit": profit,
+            "running_total": running_total,
+        })
+
+    strategies_out = []
+    for s in per_strategy.values():
+        win_rate = round(100 * s["wins"] / s["bets"], 1) if s["bets"] else 0
+        strategies_out.append({**s, "win_rate": win_rate})
+    strategies_out.sort(key=lambda x: x["profit"], reverse=True)
+
+    return {"strategies": strategies_out, "timeline": timeline}
+
+
 PAGE = """
 <!DOCTYPE html>
 <html>
@@ -116,6 +181,7 @@ PAGE = """
 <title>BetDEX Strategies</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #0a0e14; --card: #11161f; --card2: #141a25;
@@ -126,7 +192,11 @@ PAGE = """
   body { font-family: 'Inter', -apple-system, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 28px 32px 60px; }
   .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; }
   .topbar h0 { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; }
+  .topbar-actions { display: flex; gap: 10px; }
   .nav-btn { font-family: 'Inter', sans-serif; font-size: 13px; font-weight: 600; color: var(--bg); background: var(--accent); border: none; border-radius: 8px; padding: 9px 16px; cursor: pointer; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 18px; }
+  .tab { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; padding: 8px 14px; border-radius: 7px; border: 1px solid var(--border); background: var(--card2); color: var(--muted); cursor: pointer; }
+  .tab.active { color: var(--text); border-color: var(--accent); }
   h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin: 30px 0 12px; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 12px; }
   .strat-row { display: flex; justify-content: space-between; align-items: center; }
@@ -139,6 +209,18 @@ PAGE = """
   .btn { font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card2); color: var(--text); cursor: pointer; }
   .btn.danger:hover { border-color: var(--loss); color: var(--loss); }
   .add-btn { font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 10px 16px; border-radius: 8px; border: 1px dashed var(--border); background: transparent; color: var(--muted); cursor: pointer; width: 100%; margin-top: 6px; }
+
+  .stat-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .stat-card .label { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); text-transform: uppercase; }
+  .stat-card .value { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; margin-top: 6px; }
+  .value.pos { color: var(--win); }
+  .value.neg { color: var(--loss); }
+  .chart-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 20px; height: 320px; }
+  table.strat-table { width: 100%; border-collapse: collapse; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; }
+  table.strat-table th, table.strat-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  table.strat-table th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; }
+  .empty-note { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 13px; }
 
   .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; z-index: 10; }
   .modal-bg.open { display: flex; }
@@ -157,14 +239,31 @@ PAGE = """
 </head>
 <body>
   <div class="topbar">
-    <h0>betdex // manage strategies</h0>
-    <button class="nav-btn" style="background:#f5b942; color:#1a1300;" onclick="restartBot()">⟲ Restart Bot</button>
+    <h0>betdex // dashboard</h0>
+    <div class="topbar-actions">
+      <button class="nav-btn" style="background:#f5b942; color:#1a1300;" onclick="restartBot()">⟲ Restart Bot</button>
+    </div>
   </div>
 
-  <h1>Strategies</h1>
+  <div class="tabs">
+    <div class="tab active" id="tab_stats" onclick="showTab('stats')">Stats</div>
+    <div class="tab" id="tab_strategies" onclick="showTab('strategies')">Strategies</div>
+  </div>
+
   <div class="saving-banner" id="restartBanner">Restarting the bot…</div>
-  <div id="strategyList"></div>
-  <button class="add-btn" onclick="openModal(null)">+ Add strategy</button>
+
+  <div id="view_stats">
+    <div class="stat-cards" id="statCards"></div>
+    <div class="chart-wrap"><canvas id="balanceChart"></canvas></div>
+    <h1>Per Strategy</h1>
+    <div id="strategyTableWrap"></div>
+  </div>
+
+  <div id="view_strategies" style="display:none;">
+    <h1>Strategies</h1>
+    <div id="strategyList"></div>
+    <button class="add-btn" onclick="openModal(null)">+ Add strategy</button>
+  </div>
 
   <div class="modal-bg" id="modalBg">
     <div class="modal">
@@ -178,10 +277,13 @@ PAGE = """
 
         <div id="single_fields" class="field full">
           <div class="field-grid">
-            <div class="field"><label>Market type id</label><input id="f_market_type" placeholder="FOOTBALL_FULL_TIME_RESULT"></div>
+            <div class="field"><label>Sport</label><select id="f_sport" onchange="onSportChange('f_sport','f_market_type')"></select></div>
+            <div class="field"><label>Market type</label><select id="f_market_type"></select></div>
             <div class="field"><label>Min back odds</label><input id="f_min_odds" type="number" step="0.01"></div>
             <div class="field"><label>Max back odds</label><input id="f_max_odds" type="number" step="0.01"></div>
-            <div class="field"><label>Total line (Over/Under only)</label><input id="f_total_range" placeholder="e.g. 2.5"></div>
+            <div class="field"><label>Total line (exact, e.g. 2.5)</label><input id="f_total_range" placeholder="e.g. 2.5"></div>
+            <div class="field"><label>Line range min (optional, e.g. 8.5)</label><input id="f_total_range_min" type="number" step="0.5" placeholder="e.g. 8.5"></div>
+            <div class="field"><label>Line range max (optional, e.g. 10.5)</label><input id="f_total_range_max" type="number" step="0.5" placeholder="e.g. 10.5"></div>
             <div class="field">
               <label>Direction (Over/Under only)</label>
               <select id="f_total_direction">
@@ -243,6 +345,149 @@ PAGE = """
 let strategies = [];
 let editingIndex = null;
 let marketRowCount = 0;
+let balanceChart = null;
+
+const SPORTS_MARKETS = {
+  "Football": [
+    ["FOOTBALL_FULL_TIME_RESULT", "Full Time Result (1X2)"],
+    ["FOOTBALL_OVER_UNDER_TOTAL_GOALS", "Total Goals Over/Under"],
+    ["FOOTBALL_CORNERS_OVER_UNDER", "Corners Over/Under"],
+    ["FOOTBALL_BOTH_TEAMS_TO_SCORE", "Both Teams to Score"],
+    ["FOOTBALL_HALF_TIME_RESULT", "Half Time Result"],
+    ["FOOTBALL_DOUBLE_CHANCE", "Double Chance"],
+  ],
+  "Basketball": [
+    ["BASKETBALL_FULL_TIME_RESULT", "Full Time Result (Moneyline)"],
+    ["BASKETBALL_OVER_UNDER_TOTAL_POINTS", "Total Points Over/Under"],
+    ["BASKETBALL_HANDICAP", "Handicap"],
+  ],
+  "Tennis": [
+    ["TENNIS_MATCH_WINNER", "Match Winner"],
+    ["TENNIS_OVER_UNDER_TOTAL_GAMES", "Total Games Over/Under"],
+    ["TENNIS_SET_HANDICAP", "Set Handicap"],
+  ],
+  "Ice Hockey": [
+    ["ICE_HOCKEY_FULL_TIME_RESULT", "Full Time Result"],
+    ["ICE_HOCKEY_OVER_UNDER_TOTAL_GOALS", "Total Goals Over/Under"],
+  ],
+  "American Football": [
+    ["AMERICAN_FOOTBALL_FULL_TIME_RESULT", "Full Time Result (Moneyline)"],
+    ["AMERICAN_FOOTBALL_OVER_UNDER_TOTAL_POINTS", "Total Points Over/Under"],
+    ["AMERICAN_FOOTBALL_HANDICAP", "Handicap"],
+  ],
+  "Baseball": [
+    ["BASEBALL_FULL_TIME_RESULT", "Full Time Result (Moneyline)"],
+    ["BASEBALL_OVER_UNDER_TOTAL_RUNS", "Total Runs Over/Under"],
+  ],
+};
+
+function populateSportSelect(sportSelectId) {
+  const sel = document.getElementById(sportSelectId);
+  sel.innerHTML = Object.keys(SPORTS_MARKETS).map(s => `<option value="${s}">${s}</option>`).join('');
+}
+
+function populateMarketSelect(sportSelectId, marketSelectId) {
+  const sport = document.getElementById(sportSelectId).value;
+  const marketSel = document.getElementById(marketSelectId);
+  const opts = SPORTS_MARKETS[sport] || [];
+  marketSel.innerHTML = opts.map(([id, label]) => `<option value="${id}">${label}</option>`).join('');
+}
+
+function onSportChange(sportSelectId, marketSelectId) {
+  populateMarketSelect(sportSelectId, marketSelectId);
+}
+
+function setSportMarketFromType(sportSelectId, marketSelectId, marketTypeId) {
+  let sportFound = Object.keys(SPORTS_MARKETS)[0];
+  for (const [sport, list] of Object.entries(SPORTS_MARKETS)) {
+    if (list.some(([id]) => id === marketTypeId)) { sportFound = sport; break; }
+  }
+  document.getElementById(sportSelectId).value = sportFound;
+  populateMarketSelect(sportSelectId, marketSelectId);
+  if (marketTypeId) document.getElementById(marketSelectId).value = marketTypeId;
+}
+
+function showTab(tab) {
+  document.getElementById('view_stats').style.display = tab === 'stats' ? '' : 'none';
+  document.getElementById('view_strategies').style.display = tab === 'strategies' ? '' : 'none';
+  document.getElementById('tab_stats').classList.toggle('active', tab === 'stats');
+  document.getElementById('tab_strategies').classList.toggle('active', tab === 'strategies');
+  if (tab === 'stats') fetchStats();
+}
+
+function fmtMoney(n) {
+  const sign = n > 0 ? '+' : '';
+  return sign + n.toFixed(2);
+}
+
+function fetchStats() {
+  fetch('/api/stats').then(r => r.json()).then(renderStats);
+}
+
+function renderStats(data) {
+  const strategies = data.strategies || [];
+  const timeline = data.timeline || [];
+
+  const totalBets = strategies.reduce((a, s) => a + s.bets, 0);
+  const totalWins = strategies.reduce((a, s) => a + s.wins, 0);
+  const totalProfit = strategies.reduce((a, s) => a + s.profit, 0);
+  const winRate = totalBets ? (100 * totalWins / totalBets).toFixed(1) : '0.0';
+
+  document.getElementById('statCards').innerHTML = `
+    <div class="stat-card"><div class="label">Total Bets</div><div class="value">${totalBets}</div></div>
+    <div class="stat-card"><div class="label">Win Rate</div><div class="value">${winRate}%</div></div>
+    <div class="stat-card"><div class="label">Total Profit</div><div class="value ${totalProfit >= 0 ? 'pos' : 'neg'}">${fmtMoney(totalProfit)}</div></div>
+    <div class="stat-card"><div class="label">Strategies Tracked</div><div class="value">${strategies.length}</div></div>
+  `;
+
+  if (!strategies.length) {
+    document.getElementById('strategyTableWrap').innerHTML = '<p class="empty-note">No settled bets yet.</p>';
+  } else {
+    let rows = strategies.map(s => `
+      <tr>
+        <td>${s.name}</td>
+        <td>${s.bets}</td>
+        <td>${s.wins}</td>
+        <td>${s.losses}</td>
+        <td>${s.win_rate}%</td>
+        <td style="color: ${s.profit >= 0 ? 'var(--win)' : 'var(--loss)'}">${fmtMoney(s.profit)}</td>
+      </tr>`).join('');
+    document.getElementById('strategyTableWrap').innerHTML = `
+      <table class="strat-table">
+        <thead><tr><th>Strategy</th><th>Bets</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Profit</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  const labels = timeline.map(t => t.settled_at ? t.settled_at.slice(0, 16).replace('T', ' ') : '');
+  const values = timeline.map(t => t.running_total);
+
+  const ctx = document.getElementById('balanceChart').getContext('2d');
+  if (balanceChart) balanceChart.destroy();
+  balanceChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Running Profit',
+        data: values,
+        borderColor: '#5b8def',
+        backgroundColor: 'rgba(91,141,239,0.12)',
+        fill: true,
+        tension: 0.15,
+        pointRadius: 0,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#7a8699', maxTicksLimit: 8 }, grid: { color: '#1c2330' } },
+        y: { ticks: { color: '#7a8699' }, grid: { color: '#1c2330' } },
+      }
+    }
+  });
+}
 
 function fetchStrategies() {
   fetch('/api/strategies').then(r => r.json()).then(data => {
@@ -287,7 +532,8 @@ const MARKET_ROW_TEMPLATE = (idx, data={}) => `
   <div class="market-row" id="market_row_${idx}">
     <button onclick="removeMarketRow(${idx})" style="position:absolute;top:8px;right:10px;background:none;border:none;color:var(--muted);cursor:pointer;">✕</button>
     <div class="field-grid" style="grid-template-columns:1fr 1fr;">
-      <div class="field"><label>Market type id</label><input class="mr_type" value="${data.market_type_id||''}" placeholder="FOOTBALL_FULL_TIME_RESULT"></div>
+      <div class="field"><label>Sport</label><select class="mr_sport" id="mr_sport_${idx}" onchange="onSportChange('mr_sport_${idx}','mr_type_${idx}')"></select></div>
+      <div class="field"><label>Market type</label><select class="mr_type" id="mr_type_${idx}"></select></div>
       <div class="field"><label>Min odds</label><input class="mr_min" type="number" step="0.01" value="${data.min_back_odds??1.45}"></div>
       <div class="field"><label>Max odds</label><input class="mr_max" type="number" step="0.01" value="${data.max_back_odds??1.6}"></div>
       <div class="field"><label>Total line</label><input class="mr_range" value="${data.total_range||''}" placeholder="e.g. 2.5"></div>
@@ -307,6 +553,8 @@ function addMarketRow(data={}) {
   const div = document.createElement('div');
   div.innerHTML = MARKET_ROW_TEMPLATE(idx, data);
   document.getElementById('market_rows').appendChild(div.firstElementChild);
+  populateSportSelect('mr_sport_' + idx);
+  setSportMarketFromType('mr_sport_' + idx, 'mr_type_' + idx, data.market_type_id || '');
 }
 
 function removeMarketRow(idx) {
@@ -349,14 +597,18 @@ function openModal(index) {
   document.getElementById('f_multi').checked = isMulti;
   onMultiToggle();
 
+  populateSportSelect('f_sport');
+  setSportMarketFromType('f_sport', 'f_market_type', s.market_type_id || '');
+
   if (isMulti) {
     (s.market_configs || [{}]).forEach(c => addMarketRow(c));
   } else {
     addMarketRow();
-    document.getElementById('f_market_type').value = s.market_type_id || '';
     document.getElementById('f_min_odds').value = s.min_back_odds ?? 1.45;
     document.getElementById('f_max_odds').value = s.max_back_odds ?? 1.6;
     document.getElementById('f_total_range').value = s.total_range ?? '';
+    document.getElementById('f_total_range_min').value = s.total_range_min ?? '';
+    document.getElementById('f_total_range_max').value = s.total_range_max ?? '';
     document.getElementById('f_total_direction').value = s.total_direction ?? '';
   }
 
@@ -449,20 +701,27 @@ function saveStrategy() {
     const minOdds = parseFloat(document.getElementById('f_min_odds').value);
     const maxOdds = parseFloat(document.getElementById('f_max_odds').value);
     const totalRange = document.getElementById('f_total_range').value.trim();
+    const totalRangeMin = document.getElementById('f_total_range_min').value.trim();
+    const totalRangeMax = document.getElementById('f_total_range_max').value.trim();
     const totalDirection = document.getElementById('f_total_direction').value;
 
     if (!marketType) { showError('Market type id is required.'); return; }
     if (minOdds > maxOdds) { showError('Min odds > max odds.'); return; }
-    if (marketType.includes('OVER_UNDER') && (!totalRange || !totalDirection)) {
-      showError('Over/Under market needs total line + direction.'); return;
+    const isOverUnder = marketType.includes('OVER_UNDER');
+    const hasExactLine = totalRange && totalDirection;
+    const hasRangeLine = totalRangeMin !== '' && totalRangeMax !== '' && totalDirection;
+    if (isOverUnder && !hasExactLine && !hasRangeLine) {
+      showError('Over/Under market needs a direction, plus either an exact line or a min/max range.'); return;
     }
 
     updated.market_configs = null;
     updated.market_type_id = marketType;
     updated.min_back_odds = minOdds;
     updated.max_back_odds = maxOdds;
-    updated.total_range = marketType.includes('OVER_UNDER') ? totalRange : null;
-    updated.total_direction = marketType.includes('OVER_UNDER') ? totalDirection : null;
+    updated.total_range = isOverUnder && !hasRangeLine ? totalRange : null;
+    updated.total_range_min = isOverUnder && hasRangeLine ? parseFloat(totalRangeMin) : null;
+    updated.total_range_max = isOverUnder && hasRangeLine ? parseFloat(totalRangeMax) : null;
+    updated.total_direction = isOverUnder ? totalDirection : null;
   }
 
   if (editingIndex === null) {
@@ -511,6 +770,7 @@ function restartBot() {
 }
 
 fetchStrategies();
+fetchStats();
 </script>
 </body>
 </html>
@@ -540,6 +800,14 @@ def save_strategies():
     except Exception as e:
         return jsonify({"error": f"Could not save: {e}"}), 500
     return jsonify({"saved": True})
+
+
+@app.route("/api/stats", methods=["GET"])
+def stats():
+    try:
+        return jsonify(get_stats())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/restart_bot", methods=["POST"])

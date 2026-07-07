@@ -11,6 +11,7 @@ Docs: https://developers.betdex.com/
 
 import os
 import uuid
+import threading
 import requests
 import json
 from datetime import datetime, timedelta
@@ -23,13 +24,23 @@ class BetdexClient:
         self.api_key = os.getenv("BETDEX_API_KEY")
         self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        self.tg_chat_id_login = os.getenv("TELEGRAM_CHAT_ID_LOGIN", self.tg_chat_id)
 
         self.base_url = "https://prod.api.btdx.io"
         self.access_token = None
         self.access_expires_at = None
         self.headers = {"content-type": "application/json"}
 
-    def login(self):
+        # Every strategy calls ensure_valid_session() on its own, each
+        # from its own worker thread (via asyncio.to_thread). Without a
+        # lock, several of them can notice the token is stale at the
+        # same moment and each re-login separately — spamming Telegram
+        # with duplicate "login successful" messages. This lock makes
+        # only the first one actually log in; the rest just reuse the
+        # fresh token once they get their turn.
+        self._login_lock = threading.Lock()
+
+    def login(self, notify=True):
         """Creates a session using appId, walletId and apiKey. Stores accessToken."""
         url = f"{self.base_url}/sessions"
         payload = {"appId": self.app_id, "walletId": self.wallet_id, "apiKey": self.api_key}
@@ -40,25 +51,40 @@ class BetdexClient:
                 self.access_token = session["accessToken"]
                 self.access_expires_at = session["accessExpiresAt"]
                 self.headers["authorization"] = "Bearer " + self.access_token
-                self.send_telegram("✅ BetDEX login successful. Session token acquired.")
+                if notify:
+                    self.send_telegram("✅ BetDEX login successful. Session token acquired.", chat_id=self.tg_chat_id_login)
                 return True
-            self.send_telegram(f"❌ BetDEX login failed. Status: {response.status_code}")
+            if notify:
+                self.send_telegram(f"❌ BetDEX login failed. Status: {response.status_code}", chat_id=self.tg_chat_id_login)
             return False
         except Exception as e:
-            self.send_telegram(f"❌ BetDEX login exception: {str(e)}")
+            if notify:
+                self.send_telegram(f"❌ BetDEX login exception: {str(e)}", chat_id=self.tg_chat_id_login)
             return False
 
-    def ensure_valid_session(self):
-        """Re-login if no token, or token close to its expiry."""
+    def _token_needs_refresh(self):
         if not self.access_token or not self.access_expires_at:
-            return self.login()
+            return True
         try:
             expires = datetime.strptime(self.access_expires_at, "%Y-%m-%dT%H:%M:%S.%fZ")
         except Exception:
+            return True
+        return datetime.utcnow() >= expires - timedelta(minutes=2)
+
+    def ensure_valid_session(self):
+        """Re-login if no token, or token close to its expiry.
+
+        Locked + double-checked: if several strategies hit this at the
+        same time, only the first one inside the lock actually logs in.
+        The others wait for the lock, then see the token is fresh again
+        and skip logging in — no duplicate Telegram messages.
+        """
+        if not self._token_needs_refresh():
+            return True
+        with self._login_lock:
+            if not self._token_needs_refresh():
+                return True
             return self.login()
-        if datetime.utcnow() >= expires - timedelta(minutes=2):
-            return self.login()
-        return True
 
     def get_markets(self, market_type_id, from_datetime, statuses="Open", published=True, size=100, page=0):
         """GET /markets — list markets of one type, filtered and paginated.
@@ -184,11 +210,14 @@ class BetdexClient:
             print(f"Error fetching orders: {str(e)}")
             return None
 
-    def send_telegram(self, message):
-        if not self.tg_token or not self.tg_chat_id:
+    def send_telegram(self, message, chat_id=None):
+        if not self.tg_token:
+            return
+        target = chat_id or self.tg_chat_id
+        if not target:
             return
         url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
-        payload = {"chat_id": self.tg_chat_id, "text": message}
+        payload = {"chat_id": target, "text": message}
         try:
             requests.post(url, json=payload)
         except Exception:
