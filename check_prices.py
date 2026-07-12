@@ -9,5 +9,5 @@ if not client.login():
     print("Login failed.")
     sys.exit(1)
 
-data = client.get_market_prices("837233")
+data = client.get_market_prices("860821 ")
 print(json.dumps(data, indent=2))

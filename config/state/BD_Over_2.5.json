@@ -1,5 +1,20 @@
 {
   "current_step": 1,
-  "active_bets": [],
+  "active_bets": [
+    {
+      "order_id": "224160119",
+      "market_id": "861840",
+      "event_id": "39224",
+      "lock_at": "2026-07-12T13:35:00",
+      "placed_at": "2026-07-12T08:35:44.714969",
+      "selection_name": "Over 2.5",
+      "event_name": "Shanghai Port FC v Dalian Yingbo FC",
+      "league": "China Super League",
+      "stake": 0.1,
+      "price": 1.6,
+      "step": 1,
+      "record_id": 36
+    }
+  ],
   "balance": null
 }

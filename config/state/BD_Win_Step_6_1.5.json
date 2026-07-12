@@ -1,5 +1,20 @@
 {
-  "current_step": 2,
-  "active_bets": [],
+  "current_step": 1,
+  "active_bets": [
+    {
+      "order_id": "224189423",
+      "market_id": "862214",
+      "event_id": "39233",
+      "lock_at": "2026-07-12T14:30:00",
+      "placed_at": "2026-07-12T09:33:29.827303",
+      "selection_name": "Bodoe/Glimt",
+      "event_name": "KFUM Oslo v Bodoe/Glimt",
+      "league": "Norway Eliteserien",
+      "stake": 0.1,
+      "price": 1.54,
+      "step": 1,
+      "record_id": 37
+    }
+  ],
   "balance": null
 }

@@ -19,12 +19,19 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "bets.db")
 app = Flask(__name__)
 
 
-def load_strategies_file():
+def _load_file():
     if not os.path.isfile(STRATEGIES_FILE):
-        return []
+        return {"global_risk_rules": {}, "strategies": []}
     with open(STRATEGIES_FILE, encoding="utf-8") as f:
-        data = json.load(f)
-    return data.get("strategies", [])
+        return json.load(f)
+
+
+def load_strategies_file():
+    return _load_file().get("strategies", [])
+
+
+def load_global_risk_rules():
+    return _load_file().get("global_risk_rules", {})
 
 
 def _validate_one(s):
@@ -80,19 +87,55 @@ def validate_strategies(strategies):
     return None
 
 
-def save_strategies_file(strategies):
-    error = validate_strategies(strategies)
-    if error:
-        raise ValueError(error)
+def validate_global_risk_rules(rules):
+    if not isinstance(rules, dict):
+        return "global_risk_rules must be an object."
+    for key in ("max_spread_pct", "minimum_liquidity"):
+        if key in rules and rules[key] is not None:
+            try:
+                if float(rules[key]) < 0:
+                    return f"'{key}' can't be negative."
+            except (TypeError, ValueError):
+                return f"'{key}' must be a number."
+    return None
 
+
+def _backup_current_file():
     if os.path.isfile(STRATEGIES_FILE):
         backup_dir = os.path.join(os.path.dirname(STRATEGIES_FILE), "backups")
         os.makedirs(backup_dir, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         shutil.copy(STRATEGIES_FILE, os.path.join(backup_dir, f"strategies_{stamp}.json"))
 
+
+def save_strategies_file(strategies):
+    """Writes the strategies list, preserving whatever global_risk_rules
+    is already on disk (this endpoint only ever touches strategies).
+    """
+    error = validate_strategies(strategies)
+    if error:
+        raise ValueError(error)
+
+    global_rules = load_global_risk_rules()
+    _backup_current_file()
+
     with open(STRATEGIES_FILE, "w", encoding="utf-8") as f:
-        json.dump({"strategies": strategies}, f, indent=2)
+        json.dump({"global_risk_rules": global_rules, "strategies": strategies}, f, indent=2)
+
+
+def save_global_risk_rules(rules):
+    """Writes global_risk_rules, preserving whatever strategies list is
+    already on disk (this endpoint only ever touches global_risk_rules).
+    """
+    error = validate_global_risk_rules(rules)
+    if error:
+        raise ValueError(error)
+
+    strategies = load_strategies_file()
+    _backup_current_file()
+
+    with open(STRATEGIES_FILE, "w", encoding="utf-8") as f:
+        json.dump({"global_risk_rules": rules, "strategies": strategies}, f, indent=2)
 
 
 def restart_bot_container():
@@ -222,6 +265,12 @@ PAGE = """
   table.strat-table th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; }
   .empty-note { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 13px; }
 
+  .risk-card { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
+  .risk-field label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 5px; font-family: 'JetBrains Mono', monospace; }
+  .risk-field input { width: 160px; background: var(--card2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 10px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+  .risk-hint { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 11.5px; max-width: 340px; }
+  .risk-saved { color: var(--win); font-family: 'JetBrains Mono', monospace; font-size: 12px; display: none; }
+
   .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; z-index: 10; }
   .modal-bg.open { display: flex; }
   .modal { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; width: 640px; max-height: 85vh; overflow-y: auto; }
@@ -230,6 +279,7 @@ PAGE = """
   .field.full { grid-column: 1 / -1; }
   .field label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 5px; font-family: 'JetBrains Mono', monospace; }
   .field input, .field select { width: 100%; background: var(--card2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 10px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+  .field .subhint { color: var(--muted); font-size: 10.5px; margin-top: 3px; }
   .checkbox-row { display: flex; align-items: center; gap: 8px; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
   .error-box { background: rgba(255,107,94,0.12); border: 1px solid var(--loss); color: var(--loss); padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; display: none; }
@@ -260,6 +310,21 @@ PAGE = """
   </div>
 
   <div id="view_strategies" style="display:none;">
+    <h1>Global Risk Rules</h1>
+    <div class="card risk-card">
+      <div class="risk-field">
+        <label>Max back/lay spread (%)</label>
+        <input id="g_max_spread_pct" type="number" step="0.1" placeholder="e.g. 8">
+      </div>
+      <div class="risk-field">
+        <label>Min liquidity (both sides)</label>
+        <input id="g_min_liquidity" type="number" step="0.01" placeholder="e.g. 2">
+      </div>
+      <button class="btn" style="border-color: var(--accent); color: var(--accent);" onclick="saveGlobalRiskRules()">Save</button>
+      <span class="risk-saved" id="riskSaved">Saved.</span>
+      <div class="risk-hint">Applies to every strategy that doesn't set its own value below. A strategy's own "Max spread %" / "Minimum liquidity" always overrides these.</div>
+    </div>
+
     <h1>Strategies</h1>
     <div id="strategyList"></div>
     <button class="add-btn" onclick="openModal(null)">+ Add strategy</button>
@@ -291,6 +356,15 @@ PAGE = """
                 <option value="Over">Over</option>
                 <option value="Under">Under</option>
               </select>
+            </div>
+            <div class="field">
+              <label>Max spread % (blank = use global)</label>
+              <input id="f_max_spread_pct" type="number" step="0.1" placeholder="e.g. 8">
+            </div>
+            <div class="field">
+              <label>Min liquidity (blank = use global)</label>
+              <input id="f_min_liquidity_strat" type="number" step="0.01" placeholder="e.g. 2">
+              <div class="subhint">Required on BOTH back and lay side.</div>
             </div>
           </div>
         </div>
@@ -329,7 +403,6 @@ PAGE = """
         <div class="field"><label>Cooldown after bet (seconds)</label><input id="f_cooldown" type="number"></div>
         <div class="field"><label>Lookahead (minutes)</label><input id="f_lookahead" type="number"></div>
         <div class="field"><label>Min seconds to start</label><input id="f_min_seconds" type="number"></div>
-        <div class="field"><label>Minimum liquidity</label><input id="f_min_liquidity" type="number" step="0.01"></div>
         <div class="field full">
           <div class="checkbox-row"><input type="checkbox" id="f_enabled"><label style="margin:0;">Enabled</label></div>
         </div>
@@ -413,6 +486,7 @@ function showTab(tab) {
   document.getElementById('tab_stats').classList.toggle('active', tab === 'stats');
   document.getElementById('tab_strategies').classList.toggle('active', tab === 'strategies');
   if (tab === 'stats') fetchStats();
+  if (tab === 'strategies') fetchGlobalRiskRules();
 }
 
 function fmtMoney(n) {
@@ -489,6 +563,32 @@ function renderStats(data) {
   });
 }
 
+function fetchGlobalRiskRules() {
+  fetch('/api/global_risk_rules').then(r => r.json()).then(rules => {
+    document.getElementById('g_max_spread_pct').value = rules.max_spread_pct ?? '';
+    document.getElementById('g_min_liquidity').value = rules.minimum_liquidity ?? '';
+  });
+}
+
+function saveGlobalRiskRules() {
+  const maxSpreadRaw = document.getElementById('g_max_spread_pct').value.trim();
+  const minLiqRaw = document.getElementById('g_min_liquidity').value.trim();
+  const rules = {
+    max_spread_pct: maxSpreadRaw === '' ? null : parseFloat(maxSpreadRaw),
+    minimum_liquidity: minLiqRaw === '' ? null : parseFloat(minLiqRaw),
+  };
+  fetch('/api/global_risk_rules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rules)
+  }).then(r => r.json()).then(result => {
+    if (result.error) { alert('Could not save: ' + result.error); return; }
+    const saved = document.getElementById('riskSaved');
+    saved.style.display = 'inline';
+    setTimeout(() => { saved.style.display = 'none'; }, 2000);
+  }).catch(err => alert('Save failed: ' + err));
+}
+
 function fetchStrategies() {
   fetch('/api/strategies').then(r => r.json()).then(data => {
     strategies = Array.isArray(data) ? data : [];
@@ -512,6 +612,8 @@ function renderList() {
       metaLine += ` · compound ${s.compound_start} -> ${s.compound_target}`;
     }
     metaLine += ` · ${s.live_mode || 'pre'}`;
+    metaLine += ` · spread ${s.max_spread_pct != null ? s.max_spread_pct + '%' : 'global'}`;
+    metaLine += ` · liq ${s.minimum_liquidity != null ? s.minimum_liquidity : 'global'}`;
 
     html += `<div class="card strat-row">
       <div>
@@ -545,6 +647,8 @@ const MARKET_ROW_TEMPLATE = (idx, data={}) => `
           <option value="Under" ${data.total_direction==='Under'?'selected':''}>Under</option>
         </select>
       </div>
+      <div class="field"><label>Max spread % (blank = global)</label><input class="mr_spread" type="number" step="0.1" value="${data.max_spread_pct??''}" placeholder="e.g. 8"></div>
+      <div class="field"><label>Min liquidity (blank = global)</label><input class="mr_liq" type="number" step="0.01" value="${data.minimum_liquidity??''}" placeholder="e.g. 2"></div>
     </div>
   </div>`;
 
@@ -563,13 +667,19 @@ function removeMarketRow(idx) {
 }
 
 function getMarketRows() {
-  return Array.from(document.querySelectorAll('#market_rows .market-row')).map(row => ({
-    market_type_id: row.querySelector('.mr_type').value.trim(),
-    min_back_odds: parseFloat(row.querySelector('.mr_min').value),
-    max_back_odds: parseFloat(row.querySelector('.mr_max').value),
-    total_range: row.querySelector('.mr_range').value.trim() || null,
-    total_direction: row.querySelector('.mr_dir').value || null,
-  }));
+  return Array.from(document.querySelectorAll('#market_rows .market-row')).map(row => {
+    const spreadRaw = row.querySelector('.mr_spread').value.trim();
+    const liqRaw = row.querySelector('.mr_liq').value.trim();
+    return {
+      market_type_id: row.querySelector('.mr_type').value.trim(),
+      min_back_odds: parseFloat(row.querySelector('.mr_min').value),
+      max_back_odds: parseFloat(row.querySelector('.mr_max').value),
+      total_range: row.querySelector('.mr_range').value.trim() || null,
+      total_direction: row.querySelector('.mr_dir').value || null,
+      max_spread_pct: spreadRaw === '' ? null : parseFloat(spreadRaw),
+      minimum_liquidity: liqRaw === '' ? null : parseFloat(liqRaw),
+    };
+  });
 }
 
 function onMultiToggle() {
@@ -610,6 +720,8 @@ function openModal(index) {
     document.getElementById('f_total_range_min').value = s.total_range_min ?? '';
     document.getElementById('f_total_range_max').value = s.total_range_max ?? '';
     document.getElementById('f_total_direction').value = s.total_direction ?? '';
+    document.getElementById('f_max_spread_pct').value = s.max_spread_pct ?? '';
+    document.getElementById('f_min_liquidity_strat').value = s.minimum_liquidity ?? '';
   }
 
   const stratType = s.strategy_type || 'normal';
@@ -625,7 +737,6 @@ function openModal(index) {
   document.getElementById('f_cooldown').value = s.open_positions_cooldown_seconds ?? 600;
   document.getElementById('f_lookahead').value = s.event_lookahead_minutes ?? 180;
   document.getElementById('f_min_seconds').value = s.min_seconds_to_start ?? 300;
-  document.getElementById('f_min_liquidity').value = s.minimum_liquidity ?? 2;
   document.getElementById('f_enabled').checked = s.enabled !== false;
 
   document.getElementById('modalBg').classList.add('open');
@@ -675,7 +786,6 @@ function saveStrategy() {
     open_positions_cooldown_seconds: parseInt(document.getElementById('f_cooldown').value) || 600,
     event_lookahead_minutes: parseInt(document.getElementById('f_lookahead').value) || 180,
     min_seconds_to_start: parseInt(document.getElementById('f_min_seconds').value) || 300,
-    minimum_liquidity: parseFloat(document.getElementById('f_min_liquidity').value),
     keep_in_play: existing.keep_in_play ?? (document.getElementById('f_live_mode').value !== 'pre'),
     enabled: document.getElementById('f_enabled').checked,
   };
@@ -696,6 +806,8 @@ function saveStrategy() {
     updated.max_back_odds = rows[0].max_back_odds;
     updated.total_range = null;
     updated.total_direction = null;
+    updated.max_spread_pct = null;
+    updated.minimum_liquidity = null;
   } else {
     const marketType = document.getElementById('f_market_type').value.trim();
     const minOdds = parseFloat(document.getElementById('f_min_odds').value);
@@ -704,6 +816,8 @@ function saveStrategy() {
     const totalRangeMin = document.getElementById('f_total_range_min').value.trim();
     const totalRangeMax = document.getElementById('f_total_range_max').value.trim();
     const totalDirection = document.getElementById('f_total_direction').value;
+    const maxSpreadRaw = document.getElementById('f_max_spread_pct').value.trim();
+    const minLiqRaw = document.getElementById('f_min_liquidity_strat').value.trim();
 
     if (!marketType) { showError('Market type id is required.'); return; }
     if (minOdds > maxOdds) { showError('Min odds > max odds.'); return; }
@@ -722,6 +836,8 @@ function saveStrategy() {
     updated.total_range_min = isOverUnder && hasRangeLine ? parseFloat(totalRangeMin) : null;
     updated.total_range_max = isOverUnder && hasRangeLine ? parseFloat(totalRangeMax) : null;
     updated.total_direction = isOverUnder ? totalDirection : null;
+    updated.max_spread_pct = maxSpreadRaw === '' ? null : parseFloat(maxSpreadRaw);
+    updated.minimum_liquidity = minLiqRaw === '' ? null : parseFloat(minLiqRaw);
   }
 
   if (editingIndex === null) {
@@ -771,6 +887,7 @@ function restartBot() {
 
 fetchStrategies();
 fetchStats();
+fetchGlobalRiskRules();
 </script>
 </body>
 </html>
@@ -795,6 +912,26 @@ def save_strategies():
     strategies = request.get_json(force=True)
     try:
         save_strategies_file(strategies)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not save: {e}"}), 500
+    return jsonify({"saved": True})
+
+
+@app.route("/api/global_risk_rules", methods=["GET"])
+def get_global_risk_rules():
+    try:
+        return jsonify(load_global_risk_rules())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/global_risk_rules", methods=["POST"])
+def save_global_risk_rules_route():
+    rules = request.get_json(force=True)
+    try:
+        save_global_risk_rules(rules)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:

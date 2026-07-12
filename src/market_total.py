@@ -11,7 +11,12 @@ to check the one outcome matching the strategy's chosen direction.
 NOTE: outcome titles are actually "Over 2.5" / "Under 2.5" (line
 included in the title), not bare "Over"/"Under" — so direction is
 matched on the first word, not the whole title.
+
+Spread and two-sided liquidity are handled by market_quality.py — see
+that module for the full explanation of back/lay price semantics.
 """
+
+from market_quality import best_back, passes_quality_checks
 
 
 def market_matches_line(market, strategy):
@@ -56,20 +61,20 @@ def find_opportunity(outcomes, prices_entry, strategy):
             continue
 
         outcome_id = outcome.get("id")
-        candidates = [p for p in prices_list if p.get("side") == "Against" and p.get("outcomeId") == outcome_id]
-        if not candidates:
-            return None
-        best = max(candidates, key=lambda p: p.get("price", 0))
-        price = best.get("price")
-        amount = best.get("amount")
 
+        price, _amount = best_back(prices_list, outcome_id)
         if price is None:
             return None
         if not (strategy["min_back_odds"] <= price <= strategy["max_back_odds"]):
             return None
 
-        min_liquidity = strategy.get("minimum_liquidity")
-        if min_liquidity and amount is not None and amount < min_liquidity:
+        ok, _price, _amount, _reason = passes_quality_checks(
+            prices_list,
+            outcome_id,
+            max_spread_pct=strategy.get("max_spread_pct"),
+            minimum_liquidity=strategy.get("minimum_liquidity"),
+        )
+        if not ok:
             return None
 
         return outcome_id, title, price

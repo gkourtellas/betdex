@@ -13,6 +13,20 @@ STRATEGIES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "strat
 # write strategies.json at once and corrupt it.
 strategies_file_lock = asyncio.Lock()
 
+# Risk-rule keys that can be set once at the top level of strategies.json
+# under "global_risk_rules" and get applied to every strategy (and every
+# market_config row, for multi_market strategies) that doesn't specify
+# its own value. A strategy/market-config value always wins over the
+# global one — the global value only fills the gap when the field is
+# missing or null.
+GLOBAL_RISK_RULE_KEYS = ("max_spread_pct", "minimum_liquidity")
+
+
+def _apply_global_risk_defaults(cfg, global_rules):
+    for key in GLOBAL_RISK_RULE_KEYS:
+        if cfg.get(key) is None and global_rules.get(key) is not None:
+            cfg[key] = global_rules[key]
+
 
 async def disable_strategy(name, reason):
     """Sets enabled: false for one strategy in strategies.json. Does not
@@ -60,12 +74,17 @@ def load_strategies():
     """Returns the list of enabled, valid strategies from strategies.json.
     A strategy with a problem is skipped with a warning — it does not
     stop the other strategies from running.
+
+    Before validation, any missing max_spread_pct / minimum_liquidity is
+    filled in from the top-level "global_risk_rules" object (if present).
     """
     if not os.path.isfile(STRATEGIES_FILE):
         raise FileNotFoundError(f"Missing config: {STRATEGIES_FILE}")
 
     with open(STRATEGIES_FILE, encoding="utf-8") as f:
         data = json.load(f)
+
+    global_rules = data.get("global_risk_rules", {})
 
     all_strategies = data.get("strategies", [])
     enabled = [s for s in all_strategies if s.get("enabled", True)]
@@ -82,8 +101,10 @@ def load_strategies():
                 if not configs:
                     raise ValueError("multi_market strategy has no market_configs.")
                 for cfg in configs:
+                    _apply_global_risk_defaults(cfg, global_rules)
                     _validate_market_config(s["name"], cfg)
             else:
+                _apply_global_risk_defaults(s, global_rules)
                 _validate_market_config(s["name"], s)
 
             if s.get("strategy_type") == "compound":

@@ -1,8 +1,4 @@
 {
-  "global_risk_rules": {
-    "max_spread_pct": 8.0,
-    "minimum_liquidity": 2
-  },
   "strategies": [
     {
       "compound_start": null,
@@ -146,7 +142,7 @@
       "strategy_mode": "single",
       "strategy_type": "normal",
       "total_direction": "Over",
-      "total_range": null,
+      "total_range": "9.5",
       "total_range_max": 10.5,
       "total_range_min": 8.5
     }

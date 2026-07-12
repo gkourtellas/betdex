@@ -4,17 +4,12 @@ market (BetDEX marketType e.g. FOOTBALL_FULL_TIME_RESULT).
 Confirmed against real site data: site "Back" column = API side
 "Against". Site "Lay" column = API side "For". Backing an outcome
 means reading the "Against" price list, not "For".
+
+Spread and two-sided liquidity are handled by market_quality.py — see
+that module for the full explanation of back/lay price semantics.
 """
 
-
-def _best_for_price(prices_list, outcome_id):
-    """Best price to back at = highest 'Against' price on offer.
-    Order itself is still placed with side='For'."""
-    candidates = [p for p in prices_list if p.get("side") == "Against" and p.get("outcomeId") == outcome_id]
-    if not candidates:
-        return None, None
-    best = max(candidates, key=lambda p: p.get("price", 0))
-    return best.get("price"), best.get("amount")
+from market_quality import best_back, passes_quality_checks
 
 
 def find_opportunity(outcomes, prices_entry, strategy):
@@ -30,14 +25,19 @@ def find_opportunity(outcomes, prices_entry, strategy):
         outcome_id = outcome.get("id")
         title = outcome.get("title")
 
-        price, amount = _best_for_price(prices_list, outcome_id)
+        price, _amount = best_back(prices_list, outcome_id)
         if price is None:
             continue
         if not (strategy["min_back_odds"] <= price <= strategy["max_back_odds"]):
             continue
 
-        min_liquidity = strategy.get("minimum_liquidity")
-        if min_liquidity and amount is not None and amount < min_liquidity:
+        ok, _price, _amount, _reason = passes_quality_checks(
+            prices_list,
+            outcome_id,
+            max_spread_pct=strategy.get("max_spread_pct"),
+            minimum_liquidity=strategy.get("minimum_liquidity"),
+        )
+        if not ok:
             continue
 
         return outcome_id, title, price
