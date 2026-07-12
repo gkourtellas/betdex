@@ -2,18 +2,18 @@
   "current_step": 1,
   "active_bets": [
     {
-      "order_id": "224189423",
-      "market_id": "862214",
-      "event_id": "39233",
-      "lock_at": "2026-07-12T14:30:00",
-      "placed_at": "2026-07-12T09:33:29.827303",
-      "selection_name": "Bodoe/Glimt",
-      "event_name": "KFUM Oslo v Bodoe/Glimt",
+      "order_id": "224541008",
+      "market_id": "863596",
+      "event_id": "39317",
+      "lock_at": "2026-07-12T19:15:00",
+      "placed_at": "2026-07-12T15:12:07.889160",
+      "selection_name": "Viking FK",
+      "event_name": "Sarpsborg 08 v Viking FK",
       "league": "Norway Eliteserien",
       "stake": 0.1,
-      "price": 1.54,
+      "price": 1.64,
       "step": 1,
-      "record_id": 37
+      "record_id": 38
     }
   ],
   "balance": null

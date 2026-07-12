@@ -125,7 +125,7 @@
       "keep_in_play": false,
       "live_mode": "pre",
       "market_configs": null,
-      "market_type_id": "FOOTBALL_CORNERS_OVER_UNDER",
+      "market_type_id": "FOOTBALL_OVER_UNDER_TOTAL_CORNERS",
       "max_back_odds": 1.6,
       "max_open_bets": 1,
       "min_back_odds": 1.45,
@@ -148,8 +148,7 @@
       "total_direction": "Over",
       "total_range": null,
       "total_range_max": 10.5,
-      "total_range_min": 8.5,
-      "max_spread_pct": null
+      "total_range_min": 8.5
     }
   ]
 }

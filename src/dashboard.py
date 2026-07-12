@@ -13,6 +13,8 @@ import docker
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string, request
 
+from state_store import STATE_DIR, _safe_filename
+
 STRATEGIES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "strategies.json")
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "bets.db")
 
@@ -215,6 +217,48 @@ def get_stats():
     return {"strategies": strategies_out, "timeline": timeline}
 
 
+def get_open_bets():
+    """Reads config/state/*.json (one file per strategy) and collects
+    every currently open bet across all strategies, newest first.
+
+    Strategy names are matched back from the state filename using the
+    same _safe_filename() transform state_store.py uses to write them,
+    so disabled/removed strategies still show a readable label even if
+    they no longer exist in strategies.json.
+    """
+    strategies = load_strategies_file()
+    name_by_file = {_safe_filename(s["name"]): s["name"] for s in strategies if s.get("name")}
+
+    open_bets = []
+    if os.path.isdir(STATE_DIR):
+        for fname in os.listdir(STATE_DIR):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(STATE_DIR, fname)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    state = json.load(f)
+            except Exception:
+                continue
+
+            strategy_name = name_by_file.get(fname, fname[:-5])
+            for bet in state.get("active_bets", []):
+                open_bets.append({
+                    "strategy_name": strategy_name,
+                    "event_name": bet.get("event_name"),
+                    "league": bet.get("league"),
+                    "selection_name": bet.get("selection_name"),
+                    "price": bet.get("price"),
+                    "stake": bet.get("stake"),
+                    "step": bet.get("step"),
+                    "placed_at": bet.get("placed_at"),
+                    "lock_at": bet.get("lock_at"),
+                })
+
+    open_bets.sort(key=lambda b: b.get("placed_at") or "", reverse=True)
+    return open_bets
+
+
 PAGE = """
 <!DOCTYPE html>
 <html>
@@ -225,6 +269,11 @@ PAGE = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script>
+  if (typeof Chart === 'undefined') {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"><\\/script>');
+  }
+</script>
 <style>
   :root {
     --bg: #0a0e14; --card: #11161f; --card2: #141a25;
@@ -233,7 +282,7 @@ PAGE = """
   }
   * { box-sizing: border-box; }
   body { font-family: 'Inter', -apple-system, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 28px 32px 60px; }
-  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
   .topbar h0 { font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--muted); letter-spacing: 0.12em; text-transform: uppercase; }
   .topbar-actions { display: flex; gap: 10px; }
   .nav-btn { font-family: 'Inter', sans-serif; font-size: 13px; font-weight: 600; color: var(--bg); background: var(--accent); border: none; border-radius: 8px; padding: 9px 16px; cursor: pointer; }
@@ -265,6 +314,11 @@ PAGE = """
   table.strat-table th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; }
   .empty-note { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 13px; }
 
+  .open-bets-card { margin-bottom: 22px; }
+  .open-bets-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .open-bets-head h1 { margin: 0; }
+  .open-bets-count { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); background: var(--card2); border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; }
+
   .risk-card { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
   .risk-field label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 5px; font-family: 'JetBrains Mono', monospace; }
   .risk-field input { width: 160px; background: var(--card2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 10px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
@@ -295,12 +349,20 @@ PAGE = """
     </div>
   </div>
 
+  <div class="saving-banner" id="restartBanner">Restarting the bot…</div>
+
+  <div class="card open-bets-card">
+    <div class="open-bets-head">
+      <h1>Open Bets</h1>
+      <span class="open-bets-count" id="openBetsCount">0</span>
+    </div>
+    <div id="openBetsWrap"><p class="empty-note">Loading…</p></div>
+  </div>
+
   <div class="tabs">
     <div class="tab active" id="tab_stats" onclick="showTab('stats')">Stats</div>
     <div class="tab" id="tab_strategies" onclick="showTab('strategies')">Strategies</div>
   </div>
-
-  <div class="saving-banner" id="restartBanner">Restarting the bot…</div>
 
   <div id="view_stats">
     <div class="stat-cards" id="statCards"></div>
@@ -401,7 +463,11 @@ PAGE = """
         <div class="field"><label>Max open bets</label><input id="f_max_open_bets" type="number"></div>
         <div class="field"><label>Poll interval (seconds)</label><input id="f_poll_interval" type="number"></div>
         <div class="field"><label>Cooldown after bet (seconds)</label><input id="f_cooldown" type="number"></div>
-        <div class="field"><label>Lookahead (minutes)</label><input id="f_lookahead" type="number"></div>
+        <div class="field">
+          <label>Lookahead (minutes)</label>
+          <input id="f_lookahead" type="number">
+          <div class="subhint">How far ahead to look for matches. Some market types (e.g. Corners) get published days before kickoff — use a larger value (e.g. 4320 = 3 days) for those, not the default 180.</div>
+        </div>
         <div class="field"><label>Min seconds to start</label><input id="f_min_seconds" type="number"></div>
         <div class="field full">
           <div class="checkbox-row"><input type="checkbox" id="f_enabled"><label style="margin:0;">Enabled</label></div>
@@ -420,13 +486,21 @@ let editingIndex = null;
 let marketRowCount = 0;
 let balanceChart = null;
 
+// Market type ids confirmed against real BetDEX data via discover_market_types.py.
+// Anything not in this list should be re-verified with that script before trusting it —
+// don't add ids here from guessing/pattern-matching alone (that's how Corners broke:
+// FOOTBALL_CORNERS_OVER_UNDER was a guess and matched 0 real markets for a week).
 const SPORTS_MARKETS = {
   "Football": [
     ["FOOTBALL_FULL_TIME_RESULT", "Full Time Result (1X2)"],
-    ["FOOTBALL_OVER_UNDER_TOTAL_GOALS", "Total Goals Over/Under"],
-    ["FOOTBALL_CORNERS_OVER_UNDER", "Corners Over/Under"],
-    ["FOOTBALL_BOTH_TEAMS_TO_SCORE", "Both Teams to Score"],
+    ["FOOTBALL_FULL_TIME_RESULT_HANDICAP", "Full Time Result Handicap"],
     ["FOOTBALL_HALF_TIME_RESULT", "Half Time Result"],
+    ["FOOTBALL_HALF_TIME_RESULT_HANDICAP", "Half Time Result Handicap"],
+    ["FOOTBALL_OVER_UNDER_TOTAL_GOALS", "Total Goals Over/Under"],
+    ["FOOTBALL_OVER_UNDER_HALF_TIME_TOTAL_GOALS", "Half Time Total Goals Over/Under"],
+    ["FOOTBALL_OVER_UNDER_TOTAL_CORNERS", "Corners Over/Under"],
+    ["FOOTBALL_BOTH_TEAMS_TO_SCORE", "Both Teams to Score"],
+    ["FOOTBALL_FULL_TIME_CORRECT_SCORE", "Correct Score"],
     ["FOOTBALL_DOUBLE_CHANCE", "Double Chance"],
   ],
   "Basketball": [
@@ -449,8 +523,9 @@ const SPORTS_MARKETS = {
     ["AMERICAN_FOOTBALL_HANDICAP", "Handicap"],
   ],
   "Baseball": [
-    ["BASEBALL_FULL_TIME_RESULT", "Full Time Result (Moneyline)"],
+    ["BASEBALL_MONEYLINE", "Moneyline"],
     ["BASEBALL_OVER_UNDER_TOTAL_RUNS", "Total Runs Over/Under"],
+    ["BASEBALL_HANDICAP", "Handicap"],
   ],
 };
 
@@ -471,9 +546,19 @@ function onSportChange(sportSelectId, marketSelectId) {
 }
 
 function setSportMarketFromType(sportSelectId, marketSelectId, marketTypeId) {
-  let sportFound = Object.keys(SPORTS_MARKETS)[0];
+  let sportFound = null;
   for (const [sport, list] of Object.entries(SPORTS_MARKETS)) {
     if (list.some(([id]) => id === marketTypeId)) { sportFound = sport; break; }
+  }
+  if (!sportFound) {
+    sportFound = Object.keys(SPORTS_MARKETS)[0];
+    if (marketTypeId) {
+      // Unknown market type id — don't silently fall back to a different
+      // market. Surface it so it can't get quietly overwritten on save.
+      showError(`Warning: "${marketTypeId}" isn't in the known market type list. ` +
+                `Re-run discover_market_types.py to confirm the real id before saving, ` +
+                `or this strategy's market type may get changed unintentionally.`);
+    }
   }
   document.getElementById(sportSelectId).value = sportFound;
   populateMarketSelect(sportSelectId, marketSelectId);
@@ -492,6 +577,37 @@ function showTab(tab) {
 function fmtMoney(n) {
   const sign = n > 0 ? '+' : '';
   return sign + n.toFixed(2);
+}
+
+function fmtDate(s) {
+  return s ? s.slice(0, 16).replace('T', ' ') : '';
+}
+
+function fetchOpenBets() {
+  fetch('/api/open_bets').then(r => r.json()).then(renderOpenBets);
+}
+
+function renderOpenBets(bets) {
+  document.getElementById('openBetsCount').textContent = bets.length;
+  if (!bets.length) {
+    document.getElementById('openBetsWrap').innerHTML = '<p class="empty-note">No open bets right now.</p>';
+    return;
+  }
+  let rows = bets.map(b => `
+    <tr>
+      <td>${b.strategy_name}</td>
+      <td>${b.event_name || ''}${b.league ? ` <span style="color:var(--muted);">(${b.league})</span>` : ''}</td>
+      <td>${b.selection_name || ''}</td>
+      <td>${b.price ?? ''}</td>
+      <td>${b.stake ?? ''}</td>
+      <td>${b.step ?? ''}</td>
+      <td>${fmtDate(b.lock_at)}</td>
+    </tr>`).join('');
+  document.getElementById('openBetsWrap').innerHTML = `
+    <table class="strat-table">
+      <thead><tr><th>Strategy</th><th>Match</th><th>Selection</th><th>Price</th><th>Stake</th><th>Step</th><th>Locks At</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 function fetchStats() {
@@ -612,6 +728,7 @@ function renderList() {
       metaLine += ` · compound ${s.compound_start} -> ${s.compound_target}`;
     }
     metaLine += ` · ${s.live_mode || 'pre'}`;
+    metaLine += ` · lookahead ${s.event_lookahead_minutes ?? 180}m`;
     metaLine += ` · spread ${s.max_spread_pct != null ? s.max_spread_pct + '%' : 'global'}`;
     metaLine += ` · liq ${s.minimum_liquidity != null ? s.minimum_liquidity : 'global'}`;
 
@@ -819,7 +936,7 @@ function saveStrategy() {
     const maxSpreadRaw = document.getElementById('f_max_spread_pct').value.trim();
     const minLiqRaw = document.getElementById('f_min_liquidity_strat').value.trim();
 
-    if (!marketType) { showError('Market type id is required.'); return; }
+    if (!marketType) { showError('Market type id is required — if the dropdown looks empty, the saved market type id isn\\'t in the known list. Re-run discover_market_types.py and add it to SPORTS_MARKETS before saving, or you will lose this strategy\\'s market type.'); return; }
     if (minOdds > maxOdds) { showError('Min odds > max odds.'); return; }
     const isOverUnder = marketType.includes('OVER_UNDER');
     const hasExactLine = totalRange && totalDirection;
@@ -888,6 +1005,8 @@ function restartBot() {
 fetchStrategies();
 fetchStats();
 fetchGlobalRiskRules();
+fetchOpenBets();
+setInterval(fetchOpenBets, 15000);
 </script>
 </body>
 </html>
@@ -943,6 +1062,14 @@ def save_global_risk_rules_route():
 def stats():
     try:
         return jsonify(get_stats())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/open_bets", methods=["GET"])
+def open_bets():
+    try:
+        return jsonify(get_open_bets())
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
