@@ -10,18 +10,15 @@
       "description": "Full Time Result, martingale staking",
       "enabled": true,
       "event_lookahead_minutes": 180,
-      "flashscore_enabled": true,
-      "flashscore_min_step": 5,
       "keep_in_play": false,
       "live_mode": "pre",
       "market_configs": null,
       "market_type_id": "FOOTBALL_FULL_TIME_RESULT",
       "max_back_odds": 1.66,
       "max_open_bets": 1,
-      "max_spread_pct": null,
       "min_back_odds": 1.45,
       "min_seconds_to_start": 300,
-      "minimum_liquidity": null,
+      "minimum_liquidity": 2,
       "name": "BD_Win_Step 6/1.5",
       "open_positions_cooldown_seconds": 600,
       "poll_interval_seconds": 600,
@@ -37,9 +34,7 @@
       "strategy_mode": "single",
       "strategy_type": "normal",
       "total_direction": null,
-      "total_range": null,
-      "total_range_max": null,
-      "total_range_min": null
+      "total_range": null
     },
     {
       "compound_start": null,
@@ -55,7 +50,7 @@
       "max_open_bets": 1,
       "min_back_odds": 1.45,
       "min_seconds_to_start": 300,
-      "minimum_liquidity": null,
+      "minimum_liquidity": 2,
       "name": "BD_Over 2.5",
       "open_positions_cooldown_seconds": 600,
       "poll_interval_seconds": 600,
@@ -71,12 +66,7 @@
       "strategy_mode": "single",
       "strategy_type": "normal",
       "total_direction": "Over",
-      "total_range": "2.5",
-      "flashscore_enabled": true,
-      "flashscore_min_step": 5,
-      "total_range_min": null,
-      "total_range_max": null,
-      "max_spread_pct": null
+      "total_range": "2.5"
     },
     {
       "compound_start": 5,
@@ -138,7 +128,6 @@
       "market_type_id": "FOOTBALL_CORNERS_OVER_UNDER",
       "max_back_odds": 1.6,
       "max_open_bets": 1,
-      "max_spread_pct": null,
       "min_back_odds": 1.45,
       "min_seconds_to_start": 300,
       "minimum_liquidity": 2,
@@ -159,7 +148,8 @@
       "total_direction": "Over",
       "total_range": null,
       "total_range_max": 10.5,
-      "total_range_min": 8.5
+      "total_range_min": 8.5,
+      "max_spread_pct": null
     }
   ]
 }

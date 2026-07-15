@@ -72,6 +72,11 @@ def _validate_one(s):
         if not plan:
             return f"'{s['name']}': staking_plan must have at least one number."
 
+    if s.get("flashscore_enabled"):
+        step = s.get("flashscore_min_step")
+        if not isinstance(step, int) or step < 1:
+            return f"'{s['name']}': flashscore_min_step must be a positive whole number when Flashscore is enabled."
+
     return None
 
 
@@ -264,9 +269,6 @@ PAGE = """
 <html>
 <head>
 <meta charset="utf-8">
-<script>
-document.write('<base href="' + (window.location.pathname.startsWith('/app3') ? '/app3/' : '/') + '">');
-</script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BetDEX Strategies</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -472,6 +474,16 @@ document.write('<base href="' + (window.location.pathname.startsWith('/app3') ? 
           <div class="subhint">How far ahead to look for matches. Some market types (e.g. Corners) get published days before kickoff — use a larger value (e.g. 4320 = 3 days) for those, not the default 180.</div>
         </div>
         <div class="field"><label>Min seconds to start</label><input id="f_min_seconds" type="number"></div>
+
+        <div class="field full">
+          <div class="checkbox-row"><input type="checkbox" id="f_flashscore_enabled" onchange="onFlashscoreToggle()"><label style="margin:0;">Enable Flashscore</label></div>
+        </div>
+        <div class="field full" id="flashscore_step_field" style="display:none;">
+          <label>Only allow from step</label>
+          <input id="f_flashscore_min_step" type="number" min="1" step="1" placeholder="e.g. 4">
+          <div class="subhint">Flashscore is only used once a bet reaches this staking step or later (e.g. 4 = step 4 and beyond). Ignored for compound strategies, which only ever have one step.</div>
+        </div>
+
         <div class="field full">
           <div class="checkbox-row"><input type="checkbox" id="f_enabled"><label style="margin:0;">Enabled</label></div>
         </div>
@@ -587,7 +599,7 @@ function fmtDate(s) {
 }
 
 function fetchOpenBets() {
-  fetch('api/open_bets').then(r => r.json()).then(renderOpenBets);
+  fetch('/api/open_bets').then(r => r.json()).then(renderOpenBets);
 }
 
 function renderOpenBets(bets) {
@@ -614,7 +626,7 @@ function renderOpenBets(bets) {
 }
 
 function fetchStats() {
-  fetch('api/stats').then(r => r.json()).then(renderStats);
+  fetch('/api/stats').then(r => r.json()).then(renderStats);
 }
 
 function renderStats(data) {
@@ -683,7 +695,7 @@ function renderStats(data) {
 }
 
 function fetchGlobalRiskRules() {
-  fetch('api/global_risk_rules').then(r => r.json()).then(rules => {
+  fetch('/api/global_risk_rules').then(r => r.json()).then(rules => {
     document.getElementById('g_max_spread_pct').value = rules.max_spread_pct ?? '';
     document.getElementById('g_min_liquidity').value = rules.minimum_liquidity ?? '';
   });
@@ -696,7 +708,7 @@ function saveGlobalRiskRules() {
     max_spread_pct: maxSpreadRaw === '' ? null : parseFloat(maxSpreadRaw),
     minimum_liquidity: minLiqRaw === '' ? null : parseFloat(minLiqRaw),
   };
-  fetch('api/global_risk_rules', {
+  fetch('/api/global_risk_rules', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(rules)
@@ -709,7 +721,7 @@ function saveGlobalRiskRules() {
 }
 
 function fetchStrategies() {
-  fetch('api/strategies').then(r => r.json()).then(data => {
+  fetch('/api/strategies').then(r => r.json()).then(data => {
     strategies = Array.isArray(data) ? data : [];
     renderList();
   });
@@ -734,6 +746,9 @@ function renderList() {
     metaLine += ` · lookahead ${s.event_lookahead_minutes ?? 180}m`;
     metaLine += ` · spread ${s.max_spread_pct != null ? s.max_spread_pct + '%' : 'global'}`;
     metaLine += ` · liq ${s.minimum_liquidity != null ? s.minimum_liquidity : 'global'}`;
+    metaLine += s.flashscore_enabled
+      ? ` · flashscore from step ${s.flashscore_min_step ?? 1}`
+      : ` · flashscore off`;
 
     html += `<div class="card strat-row">
       <div>
@@ -814,6 +829,11 @@ function onStrategyTypeChange() {
   document.getElementById('normal_fields').style.display = isCompound ? 'none' : '';
 }
 
+function onFlashscoreToggle() {
+  document.getElementById('flashscore_step_field').style.display =
+    document.getElementById('f_flashscore_enabled').checked ? '' : 'none';
+}
+
 function openModal(index) {
   editingIndex = index;
   document.getElementById('errorBox').style.display = 'none';
@@ -857,6 +877,11 @@ function openModal(index) {
   document.getElementById('f_cooldown').value = s.open_positions_cooldown_seconds ?? 600;
   document.getElementById('f_lookahead').value = s.event_lookahead_minutes ?? 180;
   document.getElementById('f_min_seconds').value = s.min_seconds_to_start ?? 300;
+
+  document.getElementById('f_flashscore_enabled').checked = !!s.flashscore_enabled;
+  document.getElementById('f_flashscore_min_step').value = s.flashscore_min_step ?? '';
+  onFlashscoreToggle();
+
   document.getElementById('f_enabled').checked = s.enabled !== false;
 
   document.getElementById('modalBg').classList.add('open');
@@ -891,6 +916,20 @@ function saveStrategy() {
     if (!plan.length) { showError('Staking plan must have at least one number.'); return; }
   }
 
+  const flashscoreEnabled = document.getElementById('f_flashscore_enabled').checked;
+  let flashscoreMinStep = null;
+  if (flashscoreEnabled) {
+    flashscoreMinStep = parseInt(document.getElementById('f_flashscore_min_step').value);
+    if (!Number.isInteger(flashscoreMinStep) || flashscoreMinStep < 1) {
+      showError('Flashscore is enabled — enter a valid step number (1 or higher).');
+      return;
+    }
+    if (stratType !== 'compound' && plan && flashscoreMinStep > plan.length) {
+      showError(`Flashscore step (${flashscoreMinStep}) is beyond this strategy's last step (${plan.length}).`);
+      return;
+    }
+  }
+
   const updated = {
     ...existing,
     name,
@@ -907,6 +946,8 @@ function saveStrategy() {
     event_lookahead_minutes: parseInt(document.getElementById('f_lookahead').value) || 180,
     min_seconds_to_start: parseInt(document.getElementById('f_min_seconds').value) || 300,
     keep_in_play: existing.keep_in_play ?? (document.getElementById('f_live_mode').value !== 'pre'),
+    flashscore_enabled: flashscoreEnabled,
+    flashscore_min_step: flashscoreEnabled ? flashscoreMinStep : null,
     enabled: document.getElementById('f_enabled').checked,
   };
 
@@ -980,7 +1021,7 @@ function removeStrategy(index) {
 }
 
 function persist() {
-  fetch('api/strategies', {
+  fetch('/api/strategies', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(strategies)
@@ -993,7 +1034,7 @@ function persist() {
 
 function restartBot() {
   document.getElementById('restartBanner').style.display = 'block';
-  fetch('api/restart_bot', { method: 'POST' })
+  fetch('/api/restart_bot', { method: 'POST' })
     .then(r => r.json())
     .then(result => {
       document.getElementById('restartBanner').style.display = 'none';
