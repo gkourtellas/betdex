@@ -11,6 +11,7 @@ from api_client import BetdexClient
 from log_util import install_print_logger, setup_logging
 from strategy_loader import load_strategies
 from strategy_runner import StrategyRunner
+import league_collector
 
 
 async def main():
@@ -31,7 +32,8 @@ async def main():
     print(f"Loaded {len(strategies)} strategy(ies): {', '.join(s['name'] for s in strategies)}")
 
     runners = [StrategyRunner(s, client) for s in strategies]
-    await asyncio.gather(*(r.run() for r in runners))
+    collector_task = asyncio.create_task(league_collector.run_periodically(client, interval_hours=24))
+    await asyncio.gather(*(r.run() for r in runners), collector_task)
 
 
 if __name__ == "__main__":

@@ -506,13 +506,12 @@ const SPORTS_MARKETS = {
     ["FOOTBALL_FULL_TIME_CORRECT_SCORE", "Correct Score"],
     ["FOOTBALL_DOUBLE_CHANCE", "Double Chance"],
   ],
-  "Basketball": [
-    ["BASKETBALL_FULL_TIME_RESULT", "Full Time Result (Moneyline)"],
-    ["BASKETBALL_OVER_UNDER_TOTAL_POINTS", "Total Points Over/Under"],
-    ["BASKETBALL_HANDICAP", "Handicap"],
-  ],
+ "Basketball": [
+    ["BBALL_MONEYLINE", "Moneyline"],
+    ["BBALL_HALF_TIME_MONEYLINE", "Half Time Moneyline"],
+],
   "Tennis": [
-    ["TENNIS_MATCH_WINNER", "Match Winner"],
+    ["TENNIS_WINNER", "Match Winner"],
     ["TENNIS_OVER_UNDER_TOTAL_GAMES", "Total Games Over/Under"],
     ["TENNIS_SET_HANDICAP", "Set Handicap"],
   ],
