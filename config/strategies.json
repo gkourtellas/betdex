@@ -1,7 +1,7 @@
 {
   "global_risk_rules": {
     "max_spread_pct": 8,
-    "minimum_liquidity": 50
+    "minimum_liquidity": 5
   },
   "strategies": [
     {
