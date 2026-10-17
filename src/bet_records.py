@@ -22,20 +22,24 @@ def _connect():
             stake REAL,
             step INTEGER,
             placed_at TEXT,
+            start_time TEXT,
             settled_at TEXT,
             result TEXT,
             profit REAL
         )
     """)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(bets)").fetchall()]
+    if "start_time" not in cols:
+        conn.execute("ALTER TABLE bets ADD COLUMN start_time TEXT")
     return conn
 
 
-def record_bet_placed(strategy_name, event_name, selection_name, price, stake, step, placed_at, league=None):
+def record_bet_placed(strategy_name, event_name, selection_name, price, stake, step, placed_at, league=None, start_time=None):
     conn = _connect()
     cur = conn.execute(
-        """INSERT INTO bets (strategy_name, event_name, league, selection_name, price, stake, step, placed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (strategy_name, event_name, league, selection_name, price, stake, step, placed_at.isoformat()),
+        """INSERT INTO bets (strategy_name, event_name, league, selection_name, price, stake, step, placed_at, start_time)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (strategy_name, event_name, league, selection_name, price, stake, step, placed_at.isoformat(), start_time),
     )
     conn.commit()
     row_id = cur.lastrowid

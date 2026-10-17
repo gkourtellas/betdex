@@ -37,8 +37,12 @@ def load_state(name):
         active_bets = state.get("active_bets", [])
         balance = state.get("balance")
         for bet in active_bets:
-            bet["lock_at"] = datetime.fromisoformat(bet["lock_at"])
-            bet["placed_at"] = datetime.fromisoformat(bet["placed_at"])
+            if bet.get("lock_at"):
+                bet["lock_at"] = datetime.fromisoformat(bet["lock_at"])
+            if bet.get("placed_at"):
+                bet["placed_at"] = datetime.fromisoformat(bet["placed_at"])
+            if bet.get("start_time"):
+                bet["start_time"] = datetime.fromisoformat(bet["start_time"])
         return current_step, active_bets, balance
     except Exception as e:
         print(f"[{name}] ⚠️ Could not read saved progress ({e}). Starting fresh.")
@@ -51,7 +55,12 @@ def save_state(name, current_step, active_bets, balance=None):
         to_save = {
             "current_step": current_step,
             "active_bets": [
-                {**bet, "lock_at": bet["lock_at"].isoformat(), "placed_at": bet["placed_at"].isoformat()}
+                {
+                    **bet,
+                    "lock_at": bet["lock_at"].isoformat() if bet.get("lock_at") else None,
+                    "placed_at": bet["placed_at"].isoformat() if bet.get("placed_at") else None,
+                    "start_time": bet["start_time"].isoformat() if bet.get("start_time") else None,
+                }
                 for bet in active_bets
             ],
             "balance": balance,

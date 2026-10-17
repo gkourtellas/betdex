@@ -25,9 +25,13 @@ services:
     ports:
       - "8051:8051"
     volumes:
+      - ./logs:/app/logs
       - ./src:/app/src
       - ./config:/app/config
       - /var/run/docker.sock:/var/run/docker.sock
+      - ~/.ssh:/root/.ssh:ro
+      - .:/repo
+      - ~/.git-credentials:/root/.git-credentials:ro
     logging:
       driver: json-file
       options:

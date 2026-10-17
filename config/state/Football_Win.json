@@ -1,0 +1,48 @@
+{
+  "current_step": 1,
+  "active_bets": [
+    {
+      "order_id": "381026439",
+      "market_id": "2190952",
+      "event_id": "67758",
+      "lock_at": "2026-10-17T09:30:00",
+      "placed_at": "2026-10-17T05:29:11.653248",
+      "selection_name": "Ulsan HD FC",
+      "event_name": "Ulsan HD FC v Bucheon FC 1995",
+      "league": "South Korea K League 1",
+      "stake": 0.1,
+      "price": 1.6,
+      "step": 1,
+      "record_id": 135
+    },
+    {
+      "order_id": "381277229",
+      "market_id": "2195513",
+      "event_id": "67823",
+      "lock_at": "2026-10-17T13:30:00",
+      "placed_at": "2026-10-17T08:30:20.776093",
+      "selection_name": "Middlesbrough FC",
+      "event_name": "Middlesbrough FC v Cardiff City",
+      "league": "English Championship",
+      "stake": 0.1,
+      "price": 1.5,
+      "step": 1,
+      "record_id": 136
+    },
+    {
+      "order_id": "381333449",
+      "market_id": "2192901",
+      "event_id": "67807",
+      "lock_at": "2026-10-17T13:00:00",
+      "placed_at": "2026-10-17T09:14:25.177764",
+      "selection_name": "Dalian Yingbo FC",
+      "event_name": "Dalian Yingbo FC v Shenzhen Peng City",
+      "league": "China Super League",
+      "stake": 0.1,
+      "price": 1.6,
+      "step": 1,
+      "record_id": 137
+    }
+  ],
+  "balance": null
+}

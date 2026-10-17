@@ -1,5 +1,10 @@
 """Loads strategies.json — the one file you edit to add, remove, or
 change strategies. Nothing else needs to change when you add a strategy.
+
+Also loads config/league_categories.json, which lets strategies say
+"only bet these league categories" instead of listing leagues one by
+one. Categories are live-linked: edit the category on the dashboard
+and every strategy using it picks up the change on next restart.
 """
 
 import asyncio
@@ -7,6 +12,7 @@ import json
 import os
 
 STRATEGIES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "strategies.json")
+CATEGORIES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "league_categories.json")
 
 # One lock, shared by every strategy runner in this process, so two
 # strategies hitting balance 0 / target at the same moment can't both
@@ -26,6 +32,38 @@ def _apply_global_risk_defaults(cfg, global_rules):
     for key in GLOBAL_RISK_RULE_KEYS:
         if cfg.get(key) is None and global_rules.get(key) is not None:
             cfg[key] = global_rules[key]
+
+
+def load_categories():
+    """Returns the category -> [league names] dict from
+    league_categories.json. Empty dict if the file doesn't exist yet.
+    """
+    if not os.path.isfile(CATEGORIES_FILE):
+        return {}
+    with open(CATEGORIES_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def resolve_included_leagues(strategy):
+    """Turns a strategy's included_categories (plus included_leagues as a
+    fallback for one-off leagues not in any category) into one flat set
+    of league names this strategy is allowed to bet on.
+
+    Returns None if the strategy has no categories and no individual
+    leagues set — meaning "no filter, bet any league" (old behavior).
+    """
+    included_categories = strategy.get("included_categories") or []
+    included_leagues = strategy.get("included_leagues") or []
+
+    if not included_categories and not included_leagues:
+        return None
+
+    categories = load_categories()
+    allowed = set(included_leagues)
+    for cat_name in included_categories:
+        allowed.update(categories.get(cat_name, []))
+
+    return allowed
 
 
 async def disable_strategy(name, reason):
@@ -77,6 +115,10 @@ def load_strategies():
 
     Before validation, any missing max_spread_pct / minimum_liquidity is
     filled in from the top-level "global_risk_rules" object (if present).
+
+    Also resolves each strategy's league filter into
+    strategy["_allowed_leagues"] — a flat set of allowed league names,
+    or None for "no filter, bet any league".
     """
     if not os.path.isfile(STRATEGIES_FILE):
         raise FileNotFoundError(f"Missing config: {STRATEGIES_FILE}")
@@ -117,6 +159,11 @@ def load_strategies():
                 if len(ladder) != steps:
                     print(f"[{s['name']}] ⚠️ staking_steps ({steps}) doesn't match "
                           f"staking_plan length ({len(ladder)}). Using staking_plan length.")
+
+            # Live-linked league filter: resolved fresh every load, so
+            # editing a category on the dashboard applies on next restart
+            # without touching strategies.json.
+            s["_allowed_leagues"] = resolve_included_leagues(s)
 
             valid.append(s)
         except ValueError as e:

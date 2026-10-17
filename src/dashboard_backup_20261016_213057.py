@@ -1,0 +1,1394 @@
+"""BetDEX dashboard. Same features as the Matchbook dashboard, kept in
+BetDEX's own look (tabs on the left instead of top-right buttons).
+
+    python dashboard.py
+
+Then open http://localhost:8051 in your browser.
+
+Tabs: Stats | Strategies | Leagues | Analytics | Logs
+"""
+
+import os
+import re
+import json
+import shutil
+import sqlite3
+import docker
+from datetime import datetime
+from flask import Flask, jsonify, render_template_string, request
+
+from state_store import STATE_DIR, _safe_filename
+
+STRATEGIES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "strategies.json")
+DB_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "bets.db")
+CATEGORIES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "league_categories.json")
+LOGS_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
+
+app = Flask(__name__)
+
+BUILD_VERSION = "v1"
+
+
+# ---------- strategies.json ----------
+
+def _load_file():
+    if not os.path.isfile(STRATEGIES_FILE):
+        return {"global_risk_rules": {}, "strategies": []}
+    with open(STRATEGIES_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_strategies_file():
+    return _load_file().get("strategies", [])
+
+
+def load_global_risk_rules():
+    return _load_file().get("global_risk_rules", {})
+
+
+def _validate_one(s):
+    if not s.get("name"):
+        return "Every strategy needs a name."
+
+    if s.get("strategy_mode") == "multi_market":
+        configs = s.get("market_configs", [])
+        if not configs:
+            return f"'{s['name']}': multi market strategy needs at least one market."
+        for c in configs:
+            if not c.get("market_type_id"):
+                return f"'{s['name']}': every market row needs a market type id."
+            if c.get("min_back_odds", 0) > c.get("max_back_odds", 0):
+                return f"'{s['name']}': min odds > max odds in one of the market rows."
+            if "OVER_UNDER" in c["market_type_id"] and not (c.get("total_range") and c.get("total_direction")):
+                return f"'{s['name']}': Over/Under market row needs total_range and total_direction."
+    else:
+        if not s.get("market_type_id"):
+            return f"'{s['name']}': missing market_type_id."
+        if s.get("min_back_odds", 0) > s.get("max_back_odds", 0):
+            return f"'{s['name']}': min_back_odds is greater than max_back_odds."
+        if "OVER_UNDER" in s["market_type_id"]:
+            has_exact = s.get("total_range") and s.get("total_direction")
+            has_range = s.get("total_range_min") is not None and s.get("total_range_max") is not None and s.get("total_direction")
+            if not has_exact and not has_range:
+                return f"'{s['name']}': Over/Under market needs total_direction, plus an exact line or a min/max range."
+
+    if s.get("strategy_type") == "compound":
+        if not s.get("compound_start") or not s.get("compound_target"):
+            return f"'{s['name']}': compound strategy needs start and target amount."
+        if s.get("compound_target") <= s.get("compound_start"):
+            return f"'{s['name']}': target must be greater than starting amount."
+    else:
+        plan = s.get("staking_plan") or []
+        if not plan:
+            return f"'{s['name']}': staking_plan must have at least one number."
+
+    if s.get("flashscore_enabled"):
+        step = s.get("flashscore_min_step")
+        if not isinstance(step, int) or step < 1:
+            return f"'{s['name']}': flashscore_min_step must be a positive whole number when Flashscore is enabled."
+
+    return None
+
+
+def validate_strategies(strategies):
+    if not isinstance(strategies, list):
+        return "strategies must be a list."
+    names = []
+    for s in strategies:
+        err = _validate_one(s)
+        if err:
+            return err
+        names.append(s["name"])
+    if len(names) != len(set(names)):
+        return "Two strategies have the same name. Names must be unique."
+    return None
+
+
+def validate_global_risk_rules(rules):
+    if not isinstance(rules, dict):
+        return "global_risk_rules must be an object."
+    for key in ("max_spread_pct", "minimum_liquidity"):
+        if key in rules and rules[key] is not None:
+            try:
+                if float(rules[key]) < 0:
+                    return f"'{key}' can't be negative."
+            except (TypeError, ValueError):
+                return f"'{key}' must be a number."
+    return None
+
+
+def _backup_current_file():
+    if os.path.isfile(STRATEGIES_FILE):
+        backup_dir = os.path.join(os.path.dirname(STRATEGIES_FILE), "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shutil.copy(STRATEGIES_FILE, os.path.join(backup_dir, f"strategies_{stamp}.json"))
+
+
+def save_strategies_file(strategies):
+    error = validate_strategies(strategies)
+    if error:
+        raise ValueError(error)
+    global_rules = load_global_risk_rules()
+    _backup_current_file()
+    with open(STRATEGIES_FILE, "w", encoding="utf-8") as f:
+        json.dump({"global_risk_rules": global_rules, "strategies": strategies}, f, indent=2)
+
+
+def save_global_risk_rules(rules):
+    error = validate_global_risk_rules(rules)
+    if error:
+        raise ValueError(error)
+    strategies = load_strategies_file()
+    _backup_current_file()
+    with open(STRATEGIES_FILE, "w", encoding="utf-8") as f:
+        json.dump({"global_risk_rules": rules, "strategies": strategies}, f, indent=2)
+
+
+def restart_bot_container():
+    try:
+        client = docker.from_env()
+        container = client.containers.get("matchbook_trading_bot")
+        container.restart()
+        return True, "Bot restarted."
+    except docker.errors.NotFound:
+        return False, "Container 'matchbook_trading_bot' not found."
+    except Exception as e:
+        return False, f"Could not restart bot: {e}"
+
+
+# ---------- leagues / categories ----------
+
+def load_categories():
+    if not os.path.isfile(CATEGORIES_FILE):
+        return {}
+    with open(CATEGORIES_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_categories(data):
+    with open(CATEGORIES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_seen_leagues():
+    """Every distinct league name that has ever shown up on a bet.
+    Simple and always up to date — no separate scan/capture step needed.
+    """
+    conn = _connect_db()
+    if conn is None:
+        return []
+    rows = conn.execute(
+        "SELECT DISTINCT league FROM bets WHERE league IS NOT NULL AND league != '' ORDER BY league"
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+# ---------- db / stats ----------
+
+def _connect_db():
+    if not os.path.isfile(DB_PATH):
+        return None
+    return sqlite3.connect(DB_PATH)
+
+
+def _table_cols(conn):
+    return [r[1] for r in conn.execute("PRAGMA table_info(bets)").fetchall()]
+
+
+def get_stats():
+    conn = _connect_db()
+    if conn is None:
+        return {"strategies": [], "timeline": []}
+
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT strategy_name, event_name, league, selection_name, price, stake,
+                  result, profit, settled_at
+           FROM bets
+           WHERE result IS NOT NULL
+           ORDER BY settled_at ASC"""
+    ).fetchall()
+    conn.close()
+
+    per_strategy = {}
+    timeline = []
+    running_total = 0.0
+
+    for r in rows:
+        name = r["strategy_name"]
+        s = per_strategy.setdefault(name, {
+            "name": name, "bets": 0, "wins": 0, "losses": 0, "profit": 0.0
+        })
+        s["bets"] += 1
+        if r["result"] == "won":
+            s["wins"] += 1
+        else:
+            s["losses"] += 1
+        profit = r["profit"] or 0.0
+        s["profit"] = round(s["profit"] + profit, 4)
+
+        running_total = round(running_total + profit, 4)
+        timeline.append({
+            "settled_at": r["settled_at"],
+            "strategy_name": name,
+            "event_name": r["event_name"],
+            "result": r["result"],
+            "profit": profit,
+            "running_total": running_total,
+        })
+
+    strategies_out = []
+    for s in per_strategy.values():
+        win_rate = round(100 * s["wins"] / s["bets"], 1) if s["bets"] else 0
+        strategies_out.append({**s, "win_rate": win_rate})
+    strategies_out.sort(key=lambda x: x["profit"], reverse=True)
+
+    return {"strategies": strategies_out, "timeline": timeline}
+
+
+def get_league_breakdown():
+    conn = _connect_db()
+    if conn is None:
+        return []
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT strategy_name, league,
+                  COUNT(*) as total,
+                  SUM(CASE WHEN result = 'won' THEN 1 ELSE 0 END) as won,
+                  SUM(CASE WHEN result = 'lost' THEN 1 ELSE 0 END) as lost,
+                  COALESCE(SUM(profit), 0) as profit
+           FROM bets
+           WHERE result IS NOT NULL AND league IS NOT NULL AND league != ''
+           GROUP BY strategy_name, league
+           ORDER BY strategy_name, profit ASC"""
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["win_rate"] = round(100 * d["won"] / d["total"], 1) if d["total"] else 0
+        out.append(d)
+    return out
+
+
+def get_profit_per_league():
+    conn = _connect_db()
+    if conn is None:
+        return []
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT league,
+                  COUNT(*) as total,
+                  SUM(CASE WHEN result = 'won' THEN 1 ELSE 0 END) as won,
+                  COALESCE(SUM(profit), 0) as profit
+           FROM bets
+           WHERE result IS NOT NULL AND league IS NOT NULL AND league != ''
+           GROUP BY league
+           ORDER BY profit ASC"""
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["win_rate"] = round(100 * d["won"] / d["total"], 1) if d["total"] else 0
+        out.append(d)
+    return out
+
+
+def get_open_bets():
+    strategies = load_strategies_file()
+    name_by_file = {_safe_filename(s["name"]): s["name"] for s in strategies if s.get("name")}
+
+    open_bets = []
+    if os.path.isdir(STATE_DIR):
+        for fname in os.listdir(STATE_DIR):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(STATE_DIR, fname)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    state = json.load(f)
+            except Exception:
+                continue
+
+            strategy_name = name_by_file.get(fname, fname[:-5])
+            for bet in state.get("active_bets", []):
+                open_bets.append({
+                    "strategy_name": strategy_name,
+                    "event_name": bet.get("event_name"),
+                    "league": bet.get("league"),
+                    "selection_name": bet.get("selection_name"),
+                    "price": bet.get("price"),
+                    "stake": bet.get("stake"),
+                    "step": bet.get("step"),
+                    "placed_at": bet.get("placed_at"),
+                    "lock_at": bet.get("lock_at"),
+                })
+
+    open_bets.sort(key=lambda b: b.get("placed_at") or "", reverse=True)
+    return open_bets
+
+
+PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BetDEX Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0e14; --card: #11161f; --card2: #141a25;
+    --border: #1c2330; --text: #e4e7ec; --muted: #7a8699;
+    --win: #2dd4a8; --loss: #ff6b5e; --accent: #5b8def; --pending: #f5b942;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; }
+  .layout { display: flex; min-height: 100vh; }
+  .sidebar { width: 190px; flex-shrink: 0; background: var(--card); border-right: 1px solid var(--border); padding: 20px 0; }
+  .sidebar h0 { display:block; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--muted); letter-spacing: 0.1em; text-transform: uppercase; padding: 0 18px 16px; }
+  .side-tab { font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 11px 18px; color: var(--muted); cursor: pointer; border-left: 3px solid transparent; }
+  .side-tab.active { color: var(--text); border-left-color: var(--accent); background: var(--card2); }
+  .side-tab:hover { color: var(--text); }
+  .restart-wrap { padding: 18px; margin-top: 14px; }
+  .nav-btn { font-family: 'Inter', sans-serif; font-size: 12.5px; font-weight: 600; color: var(--bg); background: var(--pending); border: none; border-radius: 8px; padding: 9px 12px; cursor: pointer; width: 100%; }
+  .main { flex: 1; padding: 26px 32px 60px; max-width: 1200px; }
+  .saving-banner { display: none; background: rgba(245,185,66,0.12); border: 1px solid var(--pending); color: var(--pending); padding: 10px 14px; border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 13px; margin-bottom: 16px; }
+  h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin: 30px 0 12px; }
+  h1:first-of-type { margin-top: 0; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 12px; }
+  .strat-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .strat-name { font-weight: 600; font-size: 14.5px; }
+  .strat-meta { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .badge { font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 3px 8px; border-radius: 4px; margin-right: 8px; }
+  .badge.on { background: rgba(45,212,168,0.15); color: var(--win); }
+  .badge.off { background: rgba(122,134,153,0.15); color: var(--muted); }
+  .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn { font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card2); color: var(--text); cursor: pointer; }
+  .btn.danger:hover { border-color: var(--loss); color: var(--loss); }
+  .btn.accent { border-color: var(--accent); color: var(--accent); }
+  .add-btn { font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 10px 16px; border-radius: 8px; border: 1px dashed var(--border); background: transparent; color: var(--muted); cursor: pointer; width: 100%; margin-top: 6px; }
+  .stat-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .stat-card .label { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); text-transform: uppercase; }
+  .stat-card .value { font-family: 'JetBrains Mono', monospace; font-size: 22px; font-weight: 700; margin-top: 6px; }
+  .value.pos { color: var(--win); }
+  .value.neg { color: var(--loss); }
+  .chart-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 20px; height: 300px; }
+  table.strat-table { width: 100%; border-collapse: collapse; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; }
+  table.strat-table th, table.strat-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  table.strat-table th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; }
+  .empty-note { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+  .open-bets-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .open-bets-count { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); background: var(--card2); border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; }
+  .risk-card { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
+  .risk-field label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 5px; font-family: 'JetBrains Mono', monospace; }
+  .risk-field input { width: 160px; background: var(--card2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 10px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+  .risk-saved { color: var(--win); font-family: 'JetBrains Mono', monospace; font-size: 12px; display: none; }
+  .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; z-index: 10; }
+  .modal-bg.open { display: flex; }
+  .modal { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; width: 640px; max-height: 85vh; overflow-y: auto; }
+  .field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .field { margin-bottom: 12px; }
+  .field.full { grid-column: 1 / -1; }
+  .field label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 5px; font-family: 'JetBrains Mono', monospace; }
+  .field input, .field select { width: 100%; background: var(--card2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 10px; font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+  .field .subhint { color: var(--muted); font-size: 10.5px; margin-top: 3px; }
+  .checkbox-row { display: flex; align-items: center; gap: 8px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+  .error-box { background: rgba(255,107,94,0.12); border: 1px solid var(--loss); color: var(--loss); padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 14px; display: none; }
+  .market-row { background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; position: relative; }
+  .subtabs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .subtab-btn { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--muted); background: var(--card2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  .subtab-btn.active { color: var(--text); border-color: var(--accent); }
+  .subtab-pane { display: none; max-height: 200px; overflow-y: auto; background: var(--card2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .subtab-pane.active { display: block; }
+  .cat-block { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; background: var(--card2); }
+  .cat-title-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .cat-title { font-weight: 600; font-size: 14px; }
+  .cat-leagues { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--muted); line-height: 1.9; }
+  .cat-leagues a { color: var(--loss); text-decoration: none; margin-left: 4px; }
+  input[type=text] { background: var(--card2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 10px; font-family: 'JetBrains Mono', monospace; font-size: 13px; width: 100%; }
+  .add-cat-row { display: flex; gap: 8px; margin-bottom: 16px; }
+  select.plain { background: var(--card2); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 6px 8px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .layout2col { display: grid; grid-template-columns: 1fr 1.3fr; gap: 18px; }
+  .log-box { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; max-height: 70vh; overflow-y: auto; }
+  .log-line { border-bottom: 1px solid rgba(255,255,255,0.03); padding: 2px 0; }
+  .log-line.match { background: rgba(91,141,239,0.08); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="sidebar">
+    <h0>betdex // v{{ build }}</h0>
+    <div class="side-tab active" id="tab_stats" onclick="showTab('stats')">Stats</div>
+    <div class="side-tab" id="tab_strategies" onclick="showTab('strategies')">Strategies</div>
+    <div class="side-tab" id="tab_leagues" onclick="showTab('leagues')">Leagues</div>
+    <div class="side-tab" id="tab_analytics" onclick="showTab('analytics')">Analytics</div>
+    <div class="side-tab" id="tab_logs" onclick="showTab('logs')">Logs</div>
+    <div class="restart-wrap">
+      <button class="nav-btn" onclick="restartBot()">⟲ Restart Bot</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="saving-banner" id="restartBanner">Restarting the bot…</div>
+    <div class="saving-banner" id="savingBanner">Saving…</div>
+
+    <div id="view_stats">
+      <h1>Open Bets</h1>
+      <div class="card">
+        <div class="open-bets-head">
+          <span></span>
+          <span class="open-bets-count" id="openBetsCount">0</span>
+        </div>
+        <div id="openBetsWrap"><p class="empty-note">Loading…</p></div>
+      </div>
+
+      <h1>Stats</h1>
+      <div class="stat-cards" id="statCards"></div>
+      <div class="chart-wrap"><canvas id="balanceChart"></canvas></div>
+      <h1>Per Strategy</h1>
+      <div id="strategyTableWrap"></div>
+    </div>
+
+    <div id="view_strategies" style="display:none;">
+      <h1>Global Risk Rules</h1>
+      <div class="card risk-card">
+        <div class="risk-field">
+          <label>Max back/lay spread (%)</label>
+          <input id="g_max_spread_pct" type="number" step="0.1" placeholder="e.g. 8">
+        </div>
+        <div class="risk-field">
+          <label>Min liquidity (both sides)</label>
+          <input id="g_min_liquidity" type="number" step="0.01" placeholder="e.g. 2">
+        </div>
+        <button class="btn accent" onclick="saveGlobalRiskRules()">Save</button>
+        <span class="risk-saved" id="riskSaved">Saved.</span>
+      </div>
+
+      <h1>Strategies</h1>
+      <div id="strategyList"></div>
+      <button class="add-btn" onclick="openModal(null)">+ Add strategy</button>
+    </div>
+
+    <div id="view_leagues" style="display:none;">
+      <h1>Leagues &amp; Categories</h1>
+      <p class="empty-note" style="margin-bottom:14px;">Leagues shown here come from your settled/placed bets. Group them into categories, then pick categories per strategy (in the strategy edit form) to restrict which leagues it bets.</p>
+      <div class="add-cat-row">
+        <input type="text" id="newCatName" placeholder="New category name">
+        <button class="btn" onclick="addCategory()">+ Add category</button>
+      </div>
+      <div class="layout2col">
+        <div class="card">
+          <h1 style="margin-top:0;">All Leagues Seen</h1>
+          <div id="leagueList"></div>
+        </div>
+        <div class="card">
+          <h1 style="margin-top:0;">Categories</h1>
+          <div id="catList"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="view_analytics" style="display:none;">
+      <h1>Cumulative Profit</h1>
+      <div class="chart-wrap"><canvas id="cumulativeChart"></canvas></div>
+      <h1>Win Rate by League — per strategy</h1>
+      <div class="card"><div id="leagueBreakdown"></div></div>
+      <h1>Profit per League</h1>
+      <div class="chart-wrap"><canvas id="leagueProfitChart"></canvas></div>
+    </div>
+
+    <div id="view_logs" style="display:none;">
+      <h1>Logs</h1>
+      <div class="subtabs">
+        <div class="subtab-btn active" data-file="bot" onclick="switchLog('bot')">Bot Log</div>
+        <div class="subtab-btn" data-file="skipped" onclick="switchLog('skipped')">Skipped Log</div>
+      </div>
+      <div class="card" style="margin-bottom:10px;">
+        <input type="text" id="logSearch" placeholder="Filter..." oninput="renderLog()">
+      </div>
+      <div class="log-box" id="logBox"><div class="empty-note">Loading…</div></div>
+    </div>
+
+  </div>
+</div>
+
+  <div class="modal-bg" id="modalBg">
+    <div class="modal">
+      <h2 id="modalTitle">Add Strategy</h2>
+      <div class="error-box" id="errorBox"></div>
+      <div class="field-grid">
+        <div class="field full"><label>Name</label><input id="f_name"></div>
+        <div class="field full">
+          <div class="checkbox-row"><input type="checkbox" id="f_multi" onchange="onMultiToggle()"><label style="margin:0;">Multi-market (bet across more than one market type)</label></div>
+        </div>
+
+        <div id="single_fields" class="field full">
+          <div class="field-grid">
+            <div class="field"><label>Sport</label><select id="f_sport" onchange="onSportChange('f_sport','f_market_type')"></select></div>
+            <div class="field"><label>Market type</label><select id="f_market_type"></select></div>
+            <div class="field"><label>Min back odds</label><input id="f_min_odds" type="number" step="0.01"></div>
+            <div class="field"><label>Max back odds</label><input id="f_max_odds" type="number" step="0.01"></div>
+            <div class="field"><label>Total line (exact, e.g. 2.5)</label><input id="f_total_range" placeholder="e.g. 2.5"></div>
+            <div class="field"><label>Line range min</label><input id="f_total_range_min" type="number" step="0.5"></div>
+            <div class="field"><label>Line range max</label><input id="f_total_range_max" type="number" step="0.5"></div>
+            <div class="field">
+              <label>Direction (Over/Under only)</label>
+              <select id="f_total_direction">
+                <option value="">— not Over/Under —</option>
+                <option value="Over">Over</option>
+                <option value="Under">Under</option>
+              </select>
+            </div>
+            <div class="field"><label>Max spread % (blank = global)</label><input id="f_max_spread_pct" type="number" step="0.1"></div>
+            <div class="field"><label>Min liquidity (blank = global)</label><input id="f_min_liquidity_strat" type="number" step="0.01"></div>
+          </div>
+        </div>
+
+        <div id="multi_fields" class="field full" style="display:none;">
+          <label>Market rows</label>
+          <div id="market_rows"></div>
+          <button class="btn" onclick="addMarketRow()" style="margin-top:6px; font-size:12px;">+ Add market</button>
+        </div>
+
+        <div class="field full">
+          <label>Strategy type</label>
+          <select id="f_strategy_type" onchange="onStrategyTypeChange()">
+            <option value="normal">Normal (staking plan)</option>
+            <option value="compound">Compound (all-in, compounding)</option>
+          </select>
+        </div>
+        <div id="compound_fields" style="display:none;">
+          <div class="field"><label>Starting amount</label><input id="f_compound_start" type="number" step="0.01"></div>
+          <div class="field"><label>Target amount</label><input id="f_compound_target" type="number" step="0.01"></div>
+        </div>
+        <div id="normal_fields">
+          <div class="field full"><label>Staking plan (comma-separated)</label><input id="f_staking_plan" placeholder="0.1, 0.3, 0.9, 2.7, 8.1, 24.3"></div>
+        </div>
+
+        <div class="field">
+          <label>Timing</label>
+          <select id="f_live_mode">
+            <option value="pre">Pre-match only</option>
+            <option value="live">Live only</option>
+            <option value="both">Both</option>
+          </select>
+        </div>
+        <div class="field"><label>Max open bets</label><input id="f_max_open_bets" type="number"></div>
+        <div class="field"><label>Poll interval (seconds)</label><input id="f_poll_interval" type="number"></div>
+        <div class="field"><label>Cooldown after bet (seconds)</label><input id="f_cooldown" type="number"></div>
+        <div class="field">
+          <label>Lookahead (minutes)</label>
+          <input id="f_lookahead" type="number">
+        </div>
+        <div class="field"><label>Min seconds to start</label><input id="f_min_seconds" type="number"></div>
+
+        <div class="field full">
+          <div class="checkbox-row"><input type="checkbox" id="f_flashscore_enabled" onchange="onFlashscoreToggle()"><label style="margin:0;">Enable Flashscore</label></div>
+        </div>
+        <div class="field full" id="flashscore_step_field" style="display:none;">
+          <label>Only allow from step</label>
+          <input id="f_flashscore_min_step" type="number" min="1" step="1">
+        </div>
+
+        <div class="field full">
+          <label>Which leagues can this strategy bet? <span style="color:var(--muted); text-transform:none;">— pick categories, or individual leagues. Leave both empty to allow any league.</span></label>
+          <div class="subtabs">
+            <div class="subtab-btn active" data-tab="f_tab_categories" onclick="switchTab('f','f_tab_categories')">Categories</div>
+            <div class="subtab-btn" data-tab="f_tab_leagues" onclick="switchTab('f','f_tab_leagues')">Individual leagues</div>
+          </div>
+          <div id="f_tab_categories" class="subtab-pane active"></div>
+          <div id="f_tab_leagues" class="subtab-pane"></div>
+        </div>
+
+        <div class="field full">
+          <div class="checkbox-row"><input type="checkbox" id="f_enabled"><label style="margin:0;">Enabled</label></div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn accent" onclick="saveStrategy()">Save</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+let strategies = [];
+let editingIndex = null;
+let marketRowCount = 0;
+let balanceChart = null;
+let cumulativeChart = null;
+let leagueProfitChart = null;
+let allLeagues = [];
+let allCategories = {};
+
+const SPORTS_MARKETS = {
+  "Football": [
+    ["FOOTBALL_FULL_TIME_RESULT", "Full Time Result (1X2)"],
+    ["FOOTBALL_FULL_TIME_RESULT_HANDICAP", "Full Time Result Handicap"],
+    ["FOOTBALL_HALF_TIME_RESULT", "Half Time Result"],
+    ["FOOTBALL_HALF_TIME_RESULT_HANDICAP", "Half Time Result Handicap"],
+    ["FOOTBALL_OVER_UNDER_TOTAL_GOALS", "Total Goals Over/Under"],
+    ["FOOTBALL_OVER_UNDER_HALF_TIME_TOTAL_GOALS", "Half Time Total Goals Over/Under"],
+    ["FOOTBALL_OVER_UNDER_TOTAL_CORNERS", "Corners Over/Under"],
+    ["FOOTBALL_BOTH_TEAMS_TO_SCORE", "Both Teams to Score"],
+    ["FOOTBALL_FULL_TIME_CORRECT_SCORE", "Correct Score"],
+    ["FOOTBALL_DOUBLE_CHANCE", "Double Chance"],
+  ],
+  "Basketball": [
+    ["BBALL_MONEYLINE", "Moneyline"],
+    ["BBALL_HALF_TIME_MONEYLINE", "Half Time Moneyline"],
+  ],
+  "Tennis": [
+    ["TENNIS_WINNER", "Match Winner"],
+    ["TENNIS_OVER_UNDER_TOTAL_GAMES", "Total Games Over/Under"],
+    ["TENNIS_SET_HANDICAP", "Set Handicap"],
+  ],
+  "Ice Hockey": [
+    ["ICE_HOCKEY_FULL_TIME_RESULT", "Full Time Result"],
+    ["ICE_HOCKEY_OVER_UNDER_TOTAL_GOALS", "Total Goals Over/Under"],
+  ],
+  "American Football": [
+    ["AMERICAN_FOOTBALL_FULL_TIME_RESULT", "Full Time Result (Moneyline)"],
+    ["AMERICAN_FOOTBALL_OVER_UNDER_TOTAL_POINTS", "Total Points Over/Under"],
+    ["AMERICAN_FOOTBALL_HANDICAP", "Handicap"],
+  ],
+  "Baseball": [
+    ["BASEBALL_MONEYLINE", "Moneyline"],
+    ["BASEBALL_OVER_UNDER_TOTAL_RUNS", "Total Runs Over/Under"],
+    ["BASEBALL_HANDICAP", "Handicap"],
+  ],
+};
+
+function showTab(tab) {
+  ["stats","strategies","leagues","analytics","logs"].forEach(t => {
+    document.getElementById('view_' + t).style.display = t === tab ? '' : 'none';
+    document.getElementById('tab_' + t).classList.toggle('active', t === tab);
+  });
+  if (tab === 'stats') fetchStats();
+  if (tab === 'strategies') { fetchGlobalRiskRules(); fetchLeagueData(); }
+  if (tab === 'leagues') fetchLeagueData(true);
+  if (tab === 'analytics') fetchAnalytics();
+  if (tab === 'logs') loadLog();
+}
+
+function fmtMoney(n) { const sign = n > 0 ? '+' : ''; return sign + n.toFixed(2); }
+function fmtDate(s) { return s ? s.slice(0, 16).replace('T', ' ') : ''; }
+
+function populateSportSelect(sportSelectId) {
+  const sel = document.getElementById(sportSelectId);
+  sel.innerHTML = Object.keys(SPORTS_MARKETS).map(s => `<option value="${s}">${s}</option>`).join('');
+}
+function populateMarketSelect(sportSelectId, marketSelectId) {
+  const sport = document.getElementById(sportSelectId).value;
+  const marketSel = document.getElementById(marketSelectId);
+  const opts = SPORTS_MARKETS[sport] || [];
+  marketSel.innerHTML = opts.map(([id, label]) => `<option value="${id}">${label}</option>`).join('');
+}
+function onSportChange(sportSelectId, marketSelectId) { populateMarketSelect(sportSelectId, marketSelectId); }
+function setSportMarketFromType(sportSelectId, marketSelectId, marketTypeId) {
+  let sportFound = null;
+  for (const [sport, list] of Object.entries(SPORTS_MARKETS)) {
+    if (list.some(([id]) => id === marketTypeId)) { sportFound = sport; break; }
+  }
+  if (!sportFound) {
+    sportFound = Object.keys(SPORTS_MARKETS)[0];
+    if (marketTypeId) showError(`Warning: "${marketTypeId}" isn't in the known market type list.`);
+  }
+  document.getElementById(sportSelectId).value = sportFound;
+  populateMarketSelect(sportSelectId, marketSelectId);
+  if (marketTypeId) document.getElementById(marketSelectId).value = marketTypeId;
+}
+
+// ---------- Stats ----------
+function fetchOpenBets() {
+  fetch('api/open_bets').then(r => r.json()).then(renderOpenBets);
+}
+function renderOpenBets(bets) {
+  document.getElementById('openBetsCount').textContent = bets.length;
+  if (!bets.length) {
+    document.getElementById('openBetsWrap').innerHTML = '<p class="empty-note">No open bets right now.</p>';
+    return;
+  }
+  let rows = bets.map(b => `
+    <tr>
+      <td>${b.strategy_name}</td>
+      <td>${b.event_name || ''}${b.league ? ` <span style="color:var(--muted);">(${b.league})</span>` : ''}</td>
+      <td>${b.selection_name || ''}</td>
+      <td>${b.price ?? ''}</td>
+      <td>${b.stake ?? ''}</td>
+      <td>${b.step ?? ''}</td>
+      <td>${fmtDate(b.lock_at)}</td>
+    </tr>`).join('');
+  document.getElementById('openBetsWrap').innerHTML = `
+    <table class="strat-table">
+      <thead><tr><th>Strategy</th><th>Match</th><th>Selection</th><th>Price</th><th>Stake</th><th>Step</th><th>Locks At</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function fetchStats() {
+  fetch('api/stats').then(r => r.json()).then(renderStats);
+  fetchOpenBets();
+}
+function renderStats(data) {
+  const strategies_ = data.strategies || [];
+  const timeline = data.timeline || [];
+
+  const totalBets = strategies_.reduce((a, s) => a + s.bets, 0);
+  const totalWins = strategies_.reduce((a, s) => a + s.wins, 0);
+  const totalProfit = strategies_.reduce((a, s) => a + s.profit, 0);
+  const winRate = totalBets ? (100 * totalWins / totalBets).toFixed(1) : '0.0';
+
+  document.getElementById('statCards').innerHTML = `
+    <div class="stat-card"><div class="label">Total Bets</div><div class="value">${totalBets}</div></div>
+    <div class="stat-card"><div class="label">Win Rate</div><div class="value">${winRate}%</div></div>
+    <div class="stat-card"><div class="label">Total Profit</div><div class="value ${totalProfit >= 0 ? 'pos' : 'neg'}">${fmtMoney(totalProfit)}</div></div>
+    <div class="stat-card"><div class="label">Strategies Tracked</div><div class="value">${strategies_.length}</div></div>
+  `;
+
+  if (!strategies_.length) {
+    document.getElementById('strategyTableWrap').innerHTML = '<p class="empty-note">No settled bets yet.</p>';
+  } else {
+    let rows = strategies_.map(s => `
+      <tr>
+        <td>${s.name}</td><td>${s.bets}</td><td>${s.wins}</td><td>${s.losses}</td>
+        <td>${s.win_rate}%</td>
+        <td style="color: ${s.profit >= 0 ? 'var(--win)' : 'var(--loss)'}">${fmtMoney(s.profit)}</td>
+      </tr>`).join('');
+    document.getElementById('strategyTableWrap').innerHTML = `
+      <table class="strat-table">
+        <thead><tr><th>Strategy</th><th>Bets</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Profit</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  const labels = timeline.map(t => t.settled_at ? t.settled_at.slice(0, 16).replace('T', ' ') : '');
+  const values = timeline.map(t => t.running_total);
+  const ctx = document.getElementById('balanceChart').getContext('2d');
+  if (balanceChart) balanceChart.destroy();
+  balanceChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [{ label: 'Running Profit', data: values, borderColor: '#5b8def', backgroundColor: 'rgba(91,141,239,0.12)', fill: true, tension: 0.15, pointRadius: 0 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+      scales: { x: { ticks: { color: '#7a8699', maxTicksLimit: 8 }, grid: { color: '#1c2330' } }, y: { ticks: { color: '#7a8699' }, grid: { color: '#1c2330' } } } }
+  });
+}
+
+// ---------- Global risk ----------
+function fetchGlobalRiskRules() {
+  fetch('api/global_risk_rules').then(r => r.json()).then(rules => {
+    document.getElementById('g_max_spread_pct').value = rules.max_spread_pct ?? '';
+    document.getElementById('g_min_liquidity').value = rules.minimum_liquidity ?? '';
+  });
+}
+function saveGlobalRiskRules() {
+  const maxSpreadRaw = document.getElementById('g_max_spread_pct').value.trim();
+  const minLiqRaw = document.getElementById('g_min_liquidity').value.trim();
+  const rules = { max_spread_pct: maxSpreadRaw === '' ? null : parseFloat(maxSpreadRaw), minimum_liquidity: minLiqRaw === '' ? null : parseFloat(minLiqRaw) };
+  fetch('api/global_risk_rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rules) })
+    .then(r => r.json()).then(result => {
+      if (result.error) { alert('Could not save: ' + result.error); return; }
+      const saved = document.getElementById('riskSaved');
+      saved.style.display = 'inline';
+      setTimeout(() => { saved.style.display = 'none'; }, 2000);
+    }).catch(err => alert('Save failed: ' + err));
+}
+
+// ---------- Leagues / categories ----------
+function fetchLeagueData(rerender) {
+  Promise.all([
+    fetch('api/leagues').then(r => r.json()),
+    fetch('api/league_categories').then(r => r.json())
+  ]).then(([l, c]) => {
+    allLeagues = Array.isArray(l) ? l : [];
+    allCategories = c || {};
+    if (rerender) renderLeaguesPage();
+  });
+}
+function renderLeaguesPage() {
+  let leagueHtml = '';
+  allLeagues.forEach(name => {
+    leagueHtml += `<div style="display:flex; align-items:center; gap:8px; padding:6px 4px; font-family:'JetBrains Mono', monospace; font-size:12.5px; border-bottom:1px solid var(--border);">
+      <span style="flex:1;">${name}</span>
+    </div>`;
+  });
+  document.getElementById('leagueList').innerHTML = leagueHtml || '<p class="empty-note">No leagues seen yet — leagues appear here once bets have been placed.</p>';
+
+  const catNames = Object.keys(allCategories).sort();
+  let catHtml = '';
+  catNames.forEach(cat => {
+    const inCat = allCategories[cat] || [];
+    catHtml += `<div class="cat-block">
+      <div class="cat-title-row">
+        <div class="cat-title">${cat} (${inCat.length})</div>
+        <button class="btn danger" onclick="deleteCategory('${escName(cat)}')">Delete</button>
+      </div>
+      <div class="cat-leagues">
+        ${allLeagues.map(l => {
+          const checked = inCat.includes(l) ? 'checked' : '';
+          return `<label style="display:block;"><input type="checkbox" ${checked} onchange="toggleLeagueInCat('${escName(cat)}','${escName(l)}',this.checked)"> ${l}</label>`;
+        }).join('')}
+      </div>
+    </div>`;
+  });
+  document.getElementById('catList').innerHTML = catHtml || '<p class="empty-note">No categories yet — add one above.</p>';
+}
+function escName(name) { return name.replace(/'/g, "\\'"); }
+function addCategory() {
+  const name = document.getElementById('newCatName').value.trim();
+  if (!name) return;
+  if (!allCategories[name]) allCategories[name] = [];
+  document.getElementById('newCatName').value = '';
+  persistCategories();
+}
+function deleteCategory(name) {
+  if (!confirm('Delete category "' + name + '"?')) return;
+  delete allCategories[name];
+  persistCategories();
+}
+function toggleLeagueInCat(cat, league, on) {
+  if (!allCategories[cat]) allCategories[cat] = [];
+  if (on) { if (!allCategories[cat].includes(league)) allCategories[cat].push(league); }
+  else { allCategories[cat] = allCategories[cat].filter(l => l !== league); }
+  persistCategories();
+}
+function persistCategories() {
+  fetch('api/league_categories', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(allCategories) })
+    .then(r => r.json()).then(() => { fetchLeagueData(true); });
+}
+function renderCategoryCheckboxes(containerId, selected) {
+  const box = document.getElementById(containerId);
+  const names = Object.keys(allCategories).sort();
+  if (!names.length) { box.innerHTML = '<span style="color:var(--muted); font-size:12px;">No categories yet — add on the Leagues tab.</span>'; return; }
+  box.innerHTML = names.map(cat => {
+    const checked = selected.includes(cat) ? 'checked' : '';
+    const id = containerId + '_' + cat.replace(/[^a-zA-Z0-9]/g,'_');
+    return `<div class="checkbox-row" style="margin-bottom:4px;">
+      <input type="checkbox" id="${id}" data-category="${cat.replace(/"/g,'&quot;')}" ${checked}>
+      <label for="${id}" style="margin:0; font-family:'JetBrains Mono', monospace; font-size:12px;">${cat} (${(allCategories[cat]||[]).length})</label>
+    </div>`;
+  }).join('');
+}
+function renderLeagueCheckboxes(containerId, selected) {
+  const box = document.getElementById(containerId);
+  if (!allLeagues.length) { box.innerHTML = '<span style="color:var(--muted); font-size:12px;">No leagues seen yet.</span>'; return; }
+  box.innerHTML = allLeagues.map(name => {
+    const checked = selected.includes(name) ? 'checked' : '';
+    const id = containerId + '_' + name.replace(/[^a-zA-Z0-9]/g,'_');
+    return `<div class="checkbox-row" style="margin-bottom:4px;">
+      <input type="checkbox" id="${id}" data-league="${name.replace(/"/g,'&quot;')}" ${checked}>
+      <label for="${id}" style="margin:0; font-family:'JetBrains Mono', monospace; font-size:12px;">${name}</label>
+    </div>`;
+  }).join('');
+}
+function getCheckedCategories(containerId) {
+  return Array.from(document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`)).map(el => el.dataset.category);
+}
+function getCheckedLeagues(containerId) {
+  return Array.from(document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`)).map(el => el.dataset.league);
+}
+function switchTab(prefix, tabId) {
+  document.querySelectorAll(`.subtab-btn[data-tab^="${prefix}_tab_"]`).forEach(b => b.classList.remove('active'));
+  document.querySelector(`.subtab-btn[data-tab="${tabId}"]`).classList.add('active');
+  document.querySelectorAll(`#${prefix}_tab_categories, #${prefix}_tab_leagues`).forEach(p => p.classList.remove('active'));
+  document.getElementById(tabId).classList.add('active');
+}
+
+// ---------- Analytics ----------
+function fetchAnalytics() {
+  fetch('api/chart_data').then(r => r.json()).then(data => {
+    const cum = data.cumulative || [];
+    let running = 0;
+    const labels = [], values = [];
+    cum.forEach(b => { running += b.profit; labels.push((b.settled_at||'').slice(0,16).replace('T',' ')); values.push(running); });
+    const ctx = document.getElementById('cumulativeChart').getContext('2d');
+    if (cumulativeChart) cumulativeChart.destroy();
+    cumulativeChart = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [{ data: values, borderColor: '#5b8def', backgroundColor: 'rgba(91,141,239,0.08)', fill: true, tension: 0.2, pointRadius: 0 }] },
+      options: { plugins: { legend: { display: false } }, scales: { x: { ticks: { color:'#7a8699', maxTicksLimit:8 }, grid:{color:'#1c2330'} }, y: { ticks:{color:'#7a8699'}, grid:{color:'#1c2330'} } } }
+    });
+
+    const perLeague = data.profit_per_league || [];
+    const ctx2 = document.getElementById('leagueProfitChart').getContext('2d');
+    if (leagueProfitChart) leagueProfitChart.destroy();
+    leagueProfitChart = new Chart(ctx2, {
+      type: 'bar',
+      data: { labels: perLeague.map(l=>l.league), datasets: [{ data: perLeague.map(l=>l.profit), backgroundColor: perLeague.map(l=>l.profit>=0?'#2dd4a8':'#ff6b5e'), borderRadius: 4 }] },
+      options: { indexAxis: 'y', plugins: { legend: { display:false } }, scales: { x:{ticks:{color:'#7a8699'},grid:{color:'#1c2330'}}, y:{ticks:{color:'#7a8699'},grid:{color:'#1c2330'}} } }
+    });
+  });
+
+  fetch('api/league_breakdown').then(r => r.json()).then(rows => {
+    if (!rows.length) { document.getElementById('leagueBreakdown').innerHTML = '<p class="empty-note">No settled bets with a league yet.</p>'; return; }
+    let html = '<table class="strat-table"><tr><th>Strategy</th><th>League</th><th>Bets</th><th>Won</th><th>Lost</th><th>Win %</th><th>Profit</th></tr>';
+    rows.forEach(r => {
+      html += `<tr><td>${r.strategy_name}</td><td>${r.league}</td><td>${r.total}</td><td>${r.won}</td><td>${r.lost}</td><td>${r.win_rate}%</td>
+        <td style="color:${r.profit>=0?'var(--win)':'var(--loss)'}">${fmtMoney(r.profit)}</td></tr>`;
+    });
+    html += '</table>';
+    document.getElementById('leagueBreakdown').innerHTML = html;
+  });
+}
+
+// ---------- Logs ----------
+let currentLogFile = 'bot';
+let rawLogLines = [];
+function switchLog(file) {
+  currentLogFile = file;
+  document.querySelectorAll('.subtab-btn[data-file]').forEach(t => t.classList.toggle('active', t.dataset.file === file));
+  loadLog();
+}
+function loadLog() {
+  fetch('api/logs?file=' + currentLogFile + '&lines=400').then(r => r.json()).then(data => {
+    rawLogLines = data.lines || [];
+    renderLog();
+  });
+}
+function renderLog() {
+  const filter = document.getElementById('logSearch').value.trim().toLowerCase();
+  const box = document.getElementById('logBox');
+  const filtered = filter ? rawLogLines.filter(l => l.toLowerCase().includes(filter)) : rawLogLines;
+  if (!filtered.length) { box.innerHTML = '<div class="empty-note">No log lines yet.</div>'; return; }
+  const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  box.innerHTML = filtered.map(l => `<div class="log-line${filter?' match':''}">${esc(l)}</div>`).join('');
+  box.scrollTop = box.scrollHeight;
+}
+
+// ---------- Strategies list / modal ----------
+function fetchStrategies() {
+  fetch('api/strategies').then(r => r.json()).then(data => {
+    strategies = Array.isArray(data) ? data : [];
+    renderList();
+  });
+}
+function renderList() {
+  let html = '';
+  strategies.forEach((s, i) => {
+    const badgeClass = s.enabled ? 'on' : 'off';
+    const badgeText = s.enabled ? 'ACTIVE' : 'INACTIVE';
+    let metaLine;
+    if (s.strategy_mode === 'multi_market') {
+      metaLine = 'MULTI: ' + (s.market_configs || []).map(c => c.market_type_id).join(', ');
+    } else {
+      metaLine = `${s.market_type_id} · odds ${s.min_back_odds}-${s.max_back_odds}`;
+      if (s.total_direction) metaLine += ` · ${s.total_direction} ${s.total_range}`;
+    }
+    if (s.strategy_type === 'compound') metaLine += ` · compound ${s.compound_start} -> ${s.compound_target}`;
+    metaLine += ` · ${s.live_mode || 'pre'}`;
+    metaLine += ` · lookahead ${s.event_lookahead_minutes ?? 180}m`;
+    const cats = s.included_categories || [], leaguesFallback = s.included_leagues || [];
+    if (cats.length || leaguesFallback.length) {
+      const parts = [];
+      if (cats.length) parts.push(cats.join(', '));
+      if (leaguesFallback.length) parts.push(leaguesFallback.length + ' league(s)');
+      metaLine += ' · leagues: ' + parts.join(' + ');
+    }
+    metaLine += s.flashscore_enabled ? ` · flashscore from step ${s.flashscore_min_step ?? 1}` : ` · flashscore off`;
+
+    html += `<div class="card strat-row">
+      <div>
+        <div class="strat-name"><span class="badge ${badgeClass}">${badgeText}</span>${s.name}</div>
+        <div class="strat-meta">${metaLine}</div>
+      </div>
+      <div class="row-actions">
+        <button class="btn" onclick="openModal(${i})">Edit</button>
+        <button class="btn" onclick="toggleActive(${i})">${s.enabled ? 'Disable' : 'Enable'}</button>
+        <button class="btn danger" onclick="removeStrategy(${i})">Remove</button>
+      </div>
+    </div>`;
+  });
+  document.getElementById('strategyList').innerHTML = html || '<p class="empty-note">No strategies yet.</p>';
+}
+
+const MARKET_ROW_TEMPLATE = (idx, data={}) => `
+  <div class="market-row" id="market_row_${idx}">
+    <button onclick="removeMarketRow(${idx})" style="position:absolute;top:8px;right:10px;background:none;border:none;color:var(--muted);cursor:pointer;">✕</button>
+    <div class="field-grid" style="grid-template-columns:1fr 1fr;">
+      <div class="field"><label>Sport</label><select class="mr_sport" id="mr_sport_${idx}" onchange="onSportChange('mr_sport_${idx}','mr_type_${idx}')"></select></div>
+      <div class="field"><label>Market type</label><select class="mr_type" id="mr_type_${idx}"></select></div>
+      <div class="field"><label>Min odds</label><input class="mr_min" type="number" step="0.01" value="${data.min_back_odds??1.45}"></div>
+      <div class="field"><label>Max odds</label><input class="mr_max" type="number" step="0.01" value="${data.max_back_odds??1.6}"></div>
+      <div class="field"><label>Total line</label><input class="mr_range" value="${data.total_range||''}"></div>
+      <div class="field">
+        <label>Direction</label>
+        <select class="mr_dir">
+          <option value="" ${!data.total_direction?'selected':''}>— none —</option>
+          <option value="Over" ${data.total_direction==='Over'?'selected':''}>Over</option>
+          <option value="Under" ${data.total_direction==='Under'?'selected':''}>Under</option>
+        </select>
+      </div>
+      <div class="field"><label>Max spread % (blank=global)</label><input class="mr_spread" type="number" step="0.1" value="${data.max_spread_pct??''}"></div>
+      <div class="field"><label>Min liquidity (blank=global)</label><input class="mr_liq" type="number" step="0.01" value="${data.minimum_liquidity??''}"></div>
+    </div>
+  </div>`;
+function addMarketRow(data={}) {
+  const idx = marketRowCount++;
+  const div = document.createElement('div');
+  div.innerHTML = MARKET_ROW_TEMPLATE(idx, data);
+  document.getElementById('market_rows').appendChild(div.firstElementChild);
+  populateSportSelect('mr_sport_' + idx);
+  setSportMarketFromType('mr_sport_' + idx, 'mr_type_' + idx, data.market_type_id || '');
+}
+function removeMarketRow(idx) { const el = document.getElementById('market_row_' + idx); if (el) el.remove(); }
+function getMarketRows() {
+  return Array.from(document.querySelectorAll('#market_rows .market-row')).map(row => {
+    const spreadRaw = row.querySelector('.mr_spread').value.trim();
+    const liqRaw = row.querySelector('.mr_liq').value.trim();
+    return {
+      market_type_id: row.querySelector('.mr_type').value.trim(),
+      min_back_odds: parseFloat(row.querySelector('.mr_min').value),
+      max_back_odds: parseFloat(row.querySelector('.mr_max').value),
+      total_range: row.querySelector('.mr_range').value.trim() || null,
+      total_direction: row.querySelector('.mr_dir').value || null,
+      max_spread_pct: spreadRaw === '' ? null : parseFloat(spreadRaw),
+      minimum_liquidity: liqRaw === '' ? null : parseFloat(liqRaw),
+    };
+  });
+}
+function onMultiToggle() {
+  const isMulti = document.getElementById('f_multi').checked;
+  document.getElementById('single_fields').style.display = isMulti ? 'none' : '';
+  document.getElementById('multi_fields').style.display = isMulti ? '' : 'none';
+}
+function onStrategyTypeChange() {
+  const isCompound = document.getElementById('f_strategy_type').value === 'compound';
+  document.getElementById('compound_fields').style.display = isCompound ? '' : 'none';
+  document.getElementById('normal_fields').style.display = isCompound ? 'none' : '';
+}
+function onFlashscoreToggle() {
+  document.getElementById('flashscore_step_field').style.display = document.getElementById('f_flashscore_enabled').checked ? '' : 'none';
+}
+
+function openModal(index) {
+  editingIndex = index;
+  document.getElementById('errorBox').style.display = 'none';
+  document.getElementById('market_rows').innerHTML = '';
+  marketRowCount = 0;
+  const s = index === null ? {} : strategies[index];
+  document.getElementById('modalTitle').textContent = index === null ? 'Add Strategy' : `Edit: ${s.name}`;
+  document.getElementById('f_name').value = s.name || '';
+
+  const isMulti = s.strategy_mode === 'multi_market';
+  document.getElementById('f_multi').checked = isMulti;
+  onMultiToggle();
+  populateSportSelect('f_sport');
+  setSportMarketFromType('f_sport', 'f_market_type', s.market_type_id || '');
+
+  if (isMulti) { (s.market_configs || [{}]).forEach(c => addMarketRow(c)); }
+  else {
+    addMarketRow();
+    document.getElementById('f_min_odds').value = s.min_back_odds ?? 1.45;
+    document.getElementById('f_max_odds').value = s.max_back_odds ?? 1.6;
+    document.getElementById('f_total_range').value = s.total_range ?? '';
+    document.getElementById('f_total_range_min').value = s.total_range_min ?? '';
+    document.getElementById('f_total_range_max').value = s.total_range_max ?? '';
+    document.getElementById('f_total_direction').value = s.total_direction ?? '';
+    document.getElementById('f_max_spread_pct').value = s.max_spread_pct ?? '';
+    document.getElementById('f_min_liquidity_strat').value = s.minimum_liquidity ?? '';
+  }
+
+  const stratType = s.strategy_type || 'normal';
+  document.getElementById('f_strategy_type').value = stratType;
+  document.getElementById('f_staking_plan').value = (s.staking_plan || [0.1]).join(', ');
+  document.getElementById('f_compound_start').value = s.compound_start ?? '';
+  document.getElementById('f_compound_target').value = s.compound_target ?? '';
+  onStrategyTypeChange();
+
+  document.getElementById('f_live_mode').value = s.live_mode || 'pre';
+  document.getElementById('f_max_open_bets').value = s.max_open_bets ?? 1;
+  document.getElementById('f_poll_interval').value = s.poll_interval_seconds ?? 600;
+  document.getElementById('f_cooldown').value = s.open_positions_cooldown_seconds ?? 600;
+  document.getElementById('f_lookahead').value = s.event_lookahead_minutes ?? 180;
+  document.getElementById('f_min_seconds').value = s.min_seconds_to_start ?? 300;
+
+  document.getElementById('f_flashscore_enabled').checked = !!s.flashscore_enabled;
+  document.getElementById('f_flashscore_min_step').value = s.flashscore_min_step ?? '';
+  onFlashscoreToggle();
+
+  renderCategoryCheckboxes('f_tab_categories', s.included_categories || []);
+  renderLeagueCheckboxes('f_tab_leagues', s.included_leagues || []);
+  switchTab('f', 'f_tab_categories');
+
+  document.getElementById('f_enabled').checked = s.enabled !== false;
+  document.getElementById('modalBg').classList.add('open');
+}
+function closeModal() { document.getElementById('modalBg').classList.remove('open'); }
+function showError(msg) { const box = document.getElementById('errorBox'); box.textContent = msg; box.style.display = 'block'; }
+
+function saveStrategy() {
+  const name = document.getElementById('f_name').value.trim();
+  if (!name) { showError('Name is required.'); return; }
+  const isMulti = document.getElementById('f_multi').checked;
+  const stratType = document.getElementById('f_strategy_type').value;
+  const existing = editingIndex === null ? {} : strategies[editingIndex];
+
+  let plan = null, compoundStart = null, compoundTarget = null;
+  if (stratType === 'compound') {
+    compoundStart = parseFloat(document.getElementById('f_compound_start').value);
+    compoundTarget = parseFloat(document.getElementById('f_compound_target').value);
+    if (!compoundStart || !compoundTarget) { showError('Compound strategy needs starting and target amount.'); return; }
+    if (compoundTarget <= compoundStart) { showError('Target must be greater than starting amount.'); return; }
+  } else {
+    plan = document.getElementById('f_staking_plan').value.split(',').map(x => parseFloat(x.trim())).filter(x => !isNaN(x));
+    if (!plan.length) { showError('Staking plan must have at least one number.'); return; }
+  }
+
+  const flashscoreEnabled = document.getElementById('f_flashscore_enabled').checked;
+  let flashscoreMinStep = null;
+  if (flashscoreEnabled) {
+    flashscoreMinStep = parseInt(document.getElementById('f_flashscore_min_step').value);
+    if (!Number.isInteger(flashscoreMinStep) || flashscoreMinStep < 1) { showError('Flashscore step must be 1 or higher.'); return; }
+  }
+
+  const checkedCategories = getCheckedCategories('f_tab_categories');
+  const checkedLeagues = getCheckedLeagues('f_tab_leagues');
+
+  const updated = {
+    ...existing, name,
+    strategy_mode: isMulti ? 'multi_market' : 'single',
+    strategy_type: stratType,
+    staking_plan: plan,
+    staking_steps: plan ? plan.length : null,
+    compound_start: compoundStart,
+    compound_target: compoundTarget,
+    live_mode: document.getElementById('f_live_mode').value,
+    max_open_bets: parseInt(document.getElementById('f_max_open_bets').value) || 1,
+    poll_interval_seconds: parseInt(document.getElementById('f_poll_interval').value) || 600,
+    open_positions_cooldown_seconds: parseInt(document.getElementById('f_cooldown').value) || 600,
+    event_lookahead_minutes: parseInt(document.getElementById('f_lookahead').value) || 180,
+    min_seconds_to_start: parseInt(document.getElementById('f_min_seconds').value) || 300,
+    keep_in_play: existing.keep_in_play ?? (document.getElementById('f_live_mode').value !== 'pre'),
+    flashscore_enabled: flashscoreEnabled,
+    flashscore_min_step: flashscoreEnabled ? flashscoreMinStep : null,
+    included_categories: checkedCategories,
+    included_leagues: checkedLeagues,
+    enabled: document.getElementById('f_enabled').checked,
+  };
+
+  if (isMulti) {
+    const rows = getMarketRows();
+    if (!rows.length) { showError('Add at least one market row.'); return; }
+    for (const r of rows) {
+      if (!r.market_type_id) { showError('Every market row needs a market type id.'); return; }
+      if (r.min_back_odds > r.max_back_odds) { showError('Min odds > max odds in a market row.'); return; }
+      if (r.market_type_id.includes('OVER_UNDER') && (!r.total_range || !r.total_direction)) { showError(`Over/Under row (${r.market_type_id}) needs total line + direction.`); return; }
+    }
+    updated.market_configs = rows;
+    updated.market_type_id = rows[0].market_type_id;
+    updated.min_back_odds = rows[0].min_back_odds;
+    updated.max_back_odds = rows[0].max_back_odds;
+    updated.total_range = null; updated.total_direction = null;
+    updated.max_spread_pct = null; updated.minimum_liquidity = null;
+  } else {
+    const marketType = document.getElementById('f_market_type').value.trim();
+    const minOdds = parseFloat(document.getElementById('f_min_odds').value);
+    const maxOdds = parseFloat(document.getElementById('f_max_odds').value);
+    const totalRange = document.getElementById('f_total_range').value.trim();
+    const totalRangeMin = document.getElementById('f_total_range_min').value.trim();
+    const totalRangeMax = document.getElementById('f_total_range_max').value.trim();
+    const totalDirection = document.getElementById('f_total_direction').value;
+    const maxSpreadRaw = document.getElementById('f_max_spread_pct').value.trim();
+    const minLiqRaw = document.getElementById('f_min_liquidity_strat').value.trim();
+
+    if (!marketType) { showError('Market type id is required.'); return; }
+    if (minOdds > maxOdds) { showError('Min odds > max odds.'); return; }
+    const isOverUnder = marketType.includes('OVER_UNDER');
+    const hasExactLine = totalRange && totalDirection;
+    const hasRangeLine = totalRangeMin !== '' && totalRangeMax !== '' && totalDirection;
+    if (isOverUnder && !hasExactLine && !hasRangeLine) { showError('Over/Under market needs a direction, plus a line or a range.'); return; }
+
+    updated.market_configs = null;
+    updated.market_type_id = marketType;
+    updated.min_back_odds = minOdds;
+    updated.max_back_odds = maxOdds;
+    updated.total_range = isOverUnder && !hasRangeLine ? totalRange : null;
+    updated.total_range_min = isOverUnder && hasRangeLine ? parseFloat(totalRangeMin) : null;
+    updated.total_range_max = isOverUnder && hasRangeLine ? parseFloat(totalRangeMax) : null;
+    updated.total_direction = isOverUnder ? totalDirection : null;
+    updated.max_spread_pct = maxSpreadRaw === '' ? null : parseFloat(maxSpreadRaw);
+    updated.minimum_liquidity = minLiqRaw === '' ? null : parseFloat(minLiqRaw);
+  }
+
+  if (editingIndex === null) strategies.push(updated); else strategies[editingIndex] = updated;
+  persist();
+}
+function toggleActive(index) { strategies[index].enabled = !strategies[index].enabled; persist(); }
+function removeStrategy(index) {
+  if (!confirm(`Remove strategy "${strategies[index].name}"? A backup is kept.`)) return;
+  strategies.splice(index, 1); persist();
+}
+function persist() {
+  document.getElementById('savingBanner').style.display = 'block';
+  fetch('api/strategies', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(strategies) })
+    .then(r => r.json()).then(result => {
+      document.getElementById('savingBanner').style.display = 'none';
+      if (result.error) { showError(result.error); return; }
+      closeModal(); fetchStrategies();
+    }).catch(err => { document.getElementById('savingBanner').style.display = 'none'; showError('Save failed: ' + err); });
+}
+function restartBot() {
+  document.getElementById('restartBanner').style.display = 'block';
+  fetch('api/restart_bot', { method: 'POST' }).then(r => r.json()).then(result => {
+    document.getElementById('restartBanner').style.display = 'none';
+    alert(result.restarted ? 'Bot restarted.' : ('Restart failed: ' + result.message));
+  }).catch(err => { document.getElementById('restartBanner').style.display = 'none'; alert('Restart failed: ' + err); });
+}
+
+fetchStrategies();
+fetchStats();
+fetchLeagueData();
+setInterval(fetchOpenBets, 15000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def home():
+    return render_template_string(PAGE, build=BUILD_VERSION)
+
+
+@app.route("/api/strategies", methods=["GET"])
+def get_strategies():
+    try:
+        return jsonify(load_strategies_file())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/strategies", methods=["POST"])
+def save_strategies():
+    strategies = request.get_json(force=True)
+    try:
+        save_strategies_file(strategies)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not save: {e}"}), 500
+    return jsonify({"saved": True})
+
+
+@app.route("/api/global_risk_rules", methods=["GET"])
+def get_global_risk_rules():
+    try:
+        return jsonify(load_global_risk_rules())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/global_risk_rules", methods=["POST"])
+def save_global_risk_rules_route():
+    rules = request.get_json(force=True)
+    try:
+        save_global_risk_rules(rules)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not save: {e}"}), 500
+    return jsonify({"saved": True})
+
+
+@app.route("/api/stats", methods=["GET"])
+def stats():
+    try:
+        return jsonify(get_stats())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/open_bets", methods=["GET"])
+def open_bets():
+    try:
+        return jsonify(get_open_bets())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/restart_bot", methods=["POST"])
+def restart_bot():
+    ok, msg = restart_bot_container()
+    return jsonify({"restarted": ok, "message": msg})
+
+
+# ---------- leagues ----------
+
+@app.route("/api/leagues", methods=["GET"])
+def api_leagues():
+    try:
+        return jsonify(get_seen_leagues())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/league_categories", methods=["GET"])
+def api_get_league_categories():
+    return jsonify(load_categories())
+
+
+@app.route("/api/league_categories", methods=["POST"])
+def api_save_league_categories():
+    data = request.get_json(force=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Categories must be an object of category name -> list of leagues."}), 400
+    for cat, leagues in data.items():
+        if not isinstance(leagues, list):
+            return jsonify({"error": f"Category '{cat}' must contain a list of league names."}), 400
+    save_categories(data)
+    return jsonify({"saved": True})
+
+
+@app.route("/api/league_breakdown", methods=["GET"])
+def api_league_breakdown():
+    try:
+        return jsonify(get_league_breakdown())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/chart_data", methods=["GET"])
+def api_chart_data():
+    try:
+        conn = _connect_db()
+        cumulative = []
+        if conn is not None:
+            conn.row_factory = sqlite3.Row
+            cumulative = [dict(r) for r in conn.execute(
+                "SELECT settled_at, profit FROM bets WHERE result IS NOT NULL ORDER BY settled_at ASC"
+            ).fetchall()]
+            conn.close()
+        return jsonify({"cumulative": cumulative, "profit_per_league": get_profit_per_league()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------- logs ----------
+
+@app.route("/api/logs", methods=["GET"])
+def api_logs():
+    which = request.args.get("file", "bot")
+    lines = min(int(request.args.get("lines", 300)), 2000)
+    fname = "skipped.log" if which == "skipped" else "bot.log"
+    path = os.path.join(LOGS_DIR, fname)
+    if not os.path.isfile(path):
+        return jsonify({"lines": [], "error": f"{fname} not found yet"})
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        tail = all_lines[-lines:]
+        return jsonify({"lines": [ln.rstrip("\n") for ln in tail]})
+    except Exception as e:
+        return jsonify({"lines": [], "error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8051)

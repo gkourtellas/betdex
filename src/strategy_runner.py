@@ -5,6 +5,12 @@ the match kicks off — on some markets that's 2+ hours after real
 kickoff. All pre-match window/timing checks use the event's real
 "expectedStartTime" instead. lockAt is only used for cooldown timing
 after a bet is placed.
+
+League filter: strategies pick which leagues to bet using categories
+(config/league_categories.json), resolved to a flat allow-list in
+strategy_loader.py as strategy["_allowed_leagues"]. If that's None,
+the strategy bets any league (no filter, old behavior). If it's a
+set, only events in one of those leagues are considered.
 """
 
 import asyncio
@@ -57,6 +63,10 @@ class StrategyRunner:
         self.lookahead_minutes = strategy.get("event_lookahead_minutes", 180)
         self.min_seconds_to_start = strategy.get("min_seconds_to_start", 300)
         self.live_mode = strategy.get("live_mode", "pre")  # pre / live / both
+
+        # Set by strategy_loader.load_strategies() from included_categories /
+        # included_leagues. None means "no filter, bet any league".
+        self._allowed_leagues = strategy.get("_allowed_leagues")
 
     def log(self, msg):
         ts = datetime.now(ZoneInfo("Europe/Athens")).strftime("%Y-%m-%d %H:%M:%S")
@@ -171,6 +181,17 @@ class StrategyRunner:
                 if already_bet:
                     continue
 
+                event_name = "Unknown Match"
+                league_name = "Unknown League"
+                for ev in detail.get("events", []):
+                    event_name = ev.get("name", event_name)
+                for eg in detail.get("eventGroups", []):
+                    league_name = eg.get("name", league_name)
+
+                if self._allowed_leagues is not None and league_name not in self._allowed_leagues:
+                    self.log(f"Skipped {event_name} — league '{league_name}' is not in this strategy's allowed leagues")
+                    continue
+
                 prices_data = await asyncio.to_thread(self.client.get_market_prices, market_id)
                 if not prices_data or not prices_data.get("prices"):
                     continue
@@ -202,13 +223,6 @@ class StrategyRunner:
 
                 stake = self.stake_for_step()
 
-                event_name = "Unknown Match"
-                league_name = "Unknown League"
-                for ev in detail.get("events", []):
-                    event_name = ev.get("name", event_name)
-                for eg in detail.get("eventGroups", []):
-                    league_name = eg.get("name", league_name)
-
                 self.log(f"🎯 Match found: {event_name} -> {outcome_title} @ {price}")
 
                 order_result = await asyncio.to_thread(
@@ -231,6 +245,7 @@ class StrategyRunner:
                     "market_id": market_id,
                     "event_id": event_id,
                     "lock_at": lock_at or start_time,
+                    "start_time": start_time,
                     "placed_at": datetime.utcnow(),
                     "selection_name": outcome_title,
                     "event_name": event_name,
@@ -241,7 +256,8 @@ class StrategyRunner:
                 }
                 bet["record_id"] = record_bet_placed(
                     self.name, event_name, outcome_title, price, stake,
-                    self.current_step, bet["placed_at"], league=league_name
+                    self.current_step, bet["placed_at"], league=league_name,
+                    start_time=start_time.isoformat() if start_time else None,
                 )
                 self.active_bets.append(bet)
                 self._save()
