@@ -52,7 +52,7 @@ class BetdexClient:
                 self.access_expires_at = session["accessExpiresAt"]
                 self.headers["authorization"] = "Bearer " + self.access_token
                 if notify:
-                    self.send_telegram("✅ BetDEX login successful. Session token acquired.", chat_id=self.tg_chat_id_login)
+                    pass
                 return True
             if notify:
                 self.send_telegram(f"❌ BetDEX login failed. Status: {response.status_code}", chat_id=self.tg_chat_id_login)

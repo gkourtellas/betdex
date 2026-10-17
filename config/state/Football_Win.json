@@ -30,6 +30,21 @@
       "step": 1,
       "record_id": 137,
       "start_time": null
+    },
+    {
+      "order_id": "381434354",
+      "market_id": "2202673",
+      "event_id": "67907",
+      "lock_at": "2026-10-17T15:30:00",
+      "start_time": "2026-10-17T13:30:00",
+      "placed_at": "2026-10-17T10:31:19.610489",
+      "selection_name": "Borussia Dortmund",
+      "event_name": "Union Berlin v Borussia Dortmund",
+      "league": "German Bundesliga",
+      "stake": 0.1,
+      "price": 1.58,
+      "step": 1,
+      "record_id": 138
     }
   ],
   "balance": null
