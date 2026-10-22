@@ -16,6 +16,8 @@ import json
 import shutil
 import sqlite3
 import base64
+import time
+import threading
 import docker
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -24,20 +26,34 @@ from datetime import timedelta
 from flask import Flask, jsonify, render_template_string, request, Response, send_from_directory, redirect, url_for, session
 
 from state_store import _safe_filename
+from api_client import BetdexClient
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "bets.db")
 STRATEGIES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "strategies.json")
 CATEGORIES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "league_categories.json")
+LEAGUES_SEEN_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "leagues_seen.json")
 STATE_DIR = os.path.join(os.path.dirname(__file__), "..", "config", "state")
 LOGS_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD")
 BOT_CONTAINER = "betdex_trading_bot"
 
+# All timestamps are stored as naive UTC. The dashboard shows them in Athens
+# time, so per-day grouping has to use the same zone or days will not line up
+# with what the user sees elsewhere.
+UTC_TZ = ZoneInfo("UTC")
+ATHENS_TZ = ZoneInfo("Europe/Athens")
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("DASHBOARD_SECRET_KEY", "change-me-please")
 app.permanent_session_lifetime = timedelta(days=30)
 
-BUILD_VERSION = "v17"
+BUILD_VERSION = "v18"
+
+# BetDEX wallet balance is cached server-side: the exchange wants a session
+# for every read, so polling it on each page load would log in constantly.
+BALANCE_TTL = 60
+_balance_cache = {"data": None, "at": 0.0}
+_balance_lock = threading.Lock()
 
 
 @app.route("/api/build_version")
@@ -218,16 +234,56 @@ def _connect_db():
     return sqlite3.connect(DB_PATH)
 
 
-def get_seen_leagues():
-    """Every distinct league that has ever shown up on a bet."""
+def _load_leagues_seen():
+    """config/leagues_seen.json — {sport: [league names]} collected from
+    live markets by league_collector. Empty dict if missing/corrupt.
+    """
+    if not os.path.isfile(LEAGUES_SEEN_FILE):
+        return {}
+    try:
+        with open(LEAGUES_SEEN_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, list)}
+
+
+def get_league_sports():
+    """['All'] plus every sport bucket league_collector has seen."""
+    return ["All"] + sorted(_load_leagues_seen().keys())
+
+
+def get_seen_leagues(sport="All"):
+    """Every league the bot knows about, so categories can be built for
+    leagues that haven't been bet on yet:
+
+      - leagues_seen.json — all leagues collected from live markets,
+        grouped by sport (the collector only keeps growing this);
+      - bets.db — every distinct league that has actually shown up on a
+        bet. Ground truth for real names, and it may hold leagues the
+        collector hasn't scanned yet.
+
+    sport="All" (default) returns the union; otherwise only the leagues
+    in that sport bucket.
+    """
+    by_sport = _load_leagues_seen()
+    leagues = {name for names in by_sport.values() for name in names}
+
     conn = _connect_db()
-    if conn is None:
-        return []
-    rows = conn.execute(
-        "SELECT DISTINCT league FROM bets WHERE league IS NOT NULL AND league != '' ORDER BY league"
-    ).fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+    if conn is not None:
+        rows = conn.execute(
+            "SELECT DISTINCT league FROM bets WHERE league IS NOT NULL AND league != ''"
+        ).fetchall()
+        conn.close()
+        leagues.update(r[0] for r in rows)
+
+    if sport and sport != "All":
+        in_sport = set(by_sport.get(sport, []))
+        leagues = {l for l in leagues if l in in_sport}
+
+    return sorted(leagues, key=str.lower)
 
 
 def get_open_bets():
@@ -437,6 +493,7 @@ document.write('<base href="' + (window.location.pathname.startsWith('/betdex') 
   }
   .hero-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
   .hero-value { font-family: 'JetBrains Mono', monospace; font-size: 24px; font-weight: 700; }
+  .hero-sub { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; color: var(--muted); margin-top: 6px; }
   .sub-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
   .sub-tab {
     font-family: 'JetBrains Mono', monospace;
@@ -473,6 +530,14 @@ document.write('<base href="' + (window.location.pathname.startsWith('/betdex') 
 
   <div class="saving-banner" id="restartBanner" style="border-color: var(--accent); color: var(--accent); background: rgba(91,141,239,0.12); display:none;">Restarting the bot…</div>
 
+  <div class="hero-row">
+    <div class="hero-card">
+      <div class="hero-label">BetDEX Balance</div>
+      <div class="hero-value" id="balanceValue">—</div>
+      <div class="hero-sub" id="balanceSub">loading…</div>
+    </div>
+  </div>
+
   <h1>Open Positions <span id="openCount" style="font-weight:400; text-transform:none; letter-spacing:0;">— currently pending</span></h1>
   <div class="card"><div id="pending"></div></div>
 
@@ -494,41 +559,14 @@ document.write('<base href="' + (window.location.pathname.startsWith('/betdex') 
     <canvas id="profitChart" height="90"></canvas>
   </div>
 
-  <h1 id="lbHeading">Win Rate by League <span style="font-weight:400; text-transform:none; letter-spacing:0;">— per strategy</span></h1>
+  <h1 style="margin-top:26px;">Today's Bets</h1>
   <div class="card">
-    <div style="display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap; align-items:center;">
-      <label style="font-family:'JetBrains Mono', monospace; font-size:12px; color:var(--muted); display:flex; align-items:center; gap:6px; cursor:pointer;">
-        <input type="checkbox" id="lbGroupToggle" onchange="loadLeagueBreakdown()"> Group by strategy type (Win / GG / Total)
-      </label>
-      <select id="lbStrategyFilter" onchange="renderLeagueBreakdown()" style="background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 10px; font-family:'JetBrains Mono', monospace; font-size:12px;">
+    <div style="display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap;">
+      <select id="todayStrategyFilter" onchange="renderToday()" style="background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 10px; font-family:'JetBrains Mono', monospace; font-size:12px;">
         <option value="">All strategies</option>
       </select>
-      <select id="lbLeagueFilter" onchange="renderLeagueBreakdown()" style="background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 10px; font-family:'JetBrains Mono', monospace; font-size:12px;">
-        <option value="">All leagues</option>
-      </select>
     </div>
-    <div id="leagueBreakdown"></div>
-  </div>
-
-  <h1 style="margin-top:26px;">More</h1>
-  <div class="sub-tabs" style="margin-bottom:14px;">
-    <div class="sub-tab active" data-maintab="steps">Step Frequency</div>
-    <div class="sub-tab" data-maintab="recent">Recent Bets</div>
-  </div>
-
-  <div class="maintab-panel" data-maintab-panel="steps">
-    <div class="card"><div id="steps"></div></div>
-  </div>
-
-  <div class="maintab-panel" data-maintab-panel="recent" style="display:none;">
-    <div class="card">
-      <div style="display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap;">
-        <select id="recentStrategyFilter" onchange="renderRecent()" style="background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 10px; font-family:'JetBrains Mono', monospace; font-size:12px;">
-          <option value="">All strategies</option>
-        </select>
-      </div>
-      <div id="recent"></div>
-    </div>
+    <div id="today"></div>
   </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -540,16 +578,26 @@ if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/service-w
 function fmt(n) { return (n >= 0 ? '+' : '') + n.toFixed(2); }
 function cls(n) { return n >= 0 ? 'profit' : 'loss'; }
 
-document.querySelectorAll('.sub-tab[data-maintab]').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.sub-tab[data-maintab]').forEach(t => t.classList.remove('active'));
-    tab.classList.add('active');
-    const target = tab.dataset.maintab;
-    document.querySelectorAll('.maintab-panel').forEach(p => {
-      p.style.display = p.dataset.maintabPanel === target ? '' : 'none';
-    });
+function loadBalance() {
+  fetch('api/balance').then(r => r.json()).then(d => {
+    const valEl = document.getElementById('balanceValue');
+    const subEl = document.getElementById('balanceSub');
+    if (!d.ok) {
+      valEl.textContent = '—';
+      subEl.textContent = d.error || 'unavailable';
+      return;
+    }
+    const cur = d.currency || '';
+    valEl.textContent = Number(d.balance).toFixed(2) + (cur ? ' ' + cur : '');
+    const parts = ['available ' + Number(d.available).toFixed(2)];
+    if (d.exposure) parts.push('exposure ' + Number(d.exposure).toFixed(2));
+    subEl.textContent = parts.join(' · ');
+  }).catch(() => {
+    document.getElementById('balanceValue').textContent = '—';
+    document.getElementById('balanceSub').textContent = 'unavailable';
   });
-});
+}
+loadBalance();
 
 function restartBot() {
   document.getElementById('restartBanner').style.display = 'block';
@@ -596,81 +644,6 @@ fetch('api/summary').then(r => r.json()).then(data => {
   renderSummary();
 });
 
-fetch('api/steps').then(r => r.json()).then(data => {
-  if (!data.length) {
-    document.getElementById('steps').innerHTML = '<p class="small">No multi-step strategies with bets yet.</p>';
-    return;
-  }
-  let html = '<table><tr><th>Strategy</th><th>Step</th><th>Times Reached</th></tr>';
-  let lastStrategy = null;
-  data.forEach(s => {
-    const newBlock = lastStrategy !== null && lastStrategy !== s.strategy_name;
-    html += `<tr class="${newBlock ? 'strategy-block' : ''}"><td>${s.strategy_name}</td><td>${s.step}</td><td>${s.count}</td></tr>`;
-    lastStrategy = s.strategy_name;
-  });
-  html += '</table>';
-  document.getElementById('steps').innerHTML = html;
-});
-
-let _leagueBreakdownData = [];
-let _lbGrouped = false;
-
-function renderLeagueBreakdown() {
-  const nameKey = _lbGrouped ? 'group_name' : 'strategy_name';
-  const stratVal = document.getElementById('lbStrategyFilter').value;
-  const leagueVal = document.getElementById('lbLeagueFilter').value;
-  let rows = _leagueBreakdownData;
-  if (stratVal) rows = rows.filter(r => r[nameKey] === stratVal);
-  if (leagueVal) rows = rows.filter(r => r.league === leagueVal);
-
-  if (!rows.length) {
-    document.getElementById('leagueBreakdown').innerHTML = '<p class="small">No settled bets with a captured league yet.</p>';
-    return;
-  }
-  const colLabel = _lbGrouped ? 'Group' : 'Strategy';
-  let html = `<table><tr><th>${colLabel}</th><th>League</th><th>Bets</th><th>Won</th><th>Lost</th><th>Win %</th><th>Profit</th></tr>`;
-  let lastName = null;
-  rows.forEach(r => {
-    const newBlock = lastName !== null && lastName !== r[nameKey];
-    html += `<tr class="${newBlock ? 'strategy-block' : ''}">
-      <td>${r[nameKey]}</td>
-      <td>${r.league}</td>
-      <td>${r.total}</td>
-      <td>${r.won}</td>
-      <td>${r.lost}</td>
-      <td>${r.win_rate}%</td>
-      <td class="${cls(r.profit)}">${fmt(r.profit)}</td>
-    </tr>`;
-    lastName = r[nameKey];
-  });
-  html += '</table>';
-  document.getElementById('leagueBreakdown').innerHTML = html;
-}
-
-function loadLeagueBreakdown() {
-  _lbGrouped = document.getElementById('lbGroupToggle').checked;
-  const endpoint = _lbGrouped ? 'api/group_league_breakdown' : 'api/strategy_league_breakdown';
-  const nameKey = _lbGrouped ? 'group_name' : 'strategy_name';
-  const heading = _lbGrouped ? 'grouped by strategy type' : 'per strategy';
-  document.getElementById('lbHeading').innerHTML =
-    `Win Rate by League <span style="font-weight:400; text-transform:none; letter-spacing:0;">— ${heading}</span>`;
-
-  fetch(endpoint).then(r => r.json()).then(data => {
-    _leagueBreakdownData = data;
-    const names = [...new Set(data.map(r => r[nameKey]))].sort();
-    const leagues = [...new Set(data.map(r => r.league))].sort();
-    const stratSel = document.getElementById('lbStrategyFilter');
-    const leagueSel = document.getElementById('lbLeagueFilter');
-    stratSel.innerHTML = `<option value="">All ${_lbGrouped ? 'groups' : 'strategies'}</option>`;
-    leagueSel.innerHTML = '<option value="">All leagues</option>';
-    names.forEach(s => stratSel.insertAdjacentHTML('beforeend', `<option value="${s}">${s}</option>`));
-    leagues.forEach(l => leagueSel.insertAdjacentHTML('beforeend', `<option value="${l}">${l}</option>`));
-    renderLeagueBreakdown();
-  });
-}
-
-loadLeagueBreakdown();
-
 fetch('api/pending').then(r => r.json()).then(data => {
   document.getElementById('openCount').textContent = `(${data.length}) — currently pending`;
   if (!data.length) {
@@ -698,13 +671,17 @@ fetch('api/pending').then(r => r.json()).then(data => {
   document.getElementById('pending').innerHTML = html;
 });
 
-let _recentData = [];
-function renderRecent() {
-  const filterVal = document.getElementById('recentStrategyFilter').value;
-  const rows = filterVal ? _recentData.filter(b => b.strategy_name === filterVal) : _recentData;
+let _todayData = [];
+function renderToday() {
+  const filterVal = document.getElementById('todayStrategyFilter').value;
+  const rows = filterVal ? _todayData.filter(b => b.strategy_name === filterVal) : _todayData;
+  if (!rows.length) {
+    document.getElementById('today').innerHTML = '<p class="small">No bets placed today.</p>';
+    return;
+  }
   let html = '<table><tr><th>Time</th><th>Strategy</th><th>League</th><th>Match</th><th>Selection</th><th>Odds</th><th>Stake</th><th>Step</th><th>Result</th><th>Profit</th></tr>';
   rows.forEach(b => {
-    const resultClass = b.result === 'won' ? 'profit' : 'loss';
+    const resultClass = b.result === 'won' ? 'profit' : (b.result === 'lost' ? 'loss' : '');
     html += `<tr>
       <td>${(b.placed_at || '').replace('T', ' ').slice(0, 16)}</td>
       <td>${b.strategy_name}</td>
@@ -714,19 +691,19 @@ function renderRecent() {
       <td>${b.odds}</td>
       <td>${b.stake}</td>
       <td>${b.step}</td>
-      <td class="${resultClass}">${b.result}</td>
-      <td class="${cls(b.profit || 0)}">${fmt(b.profit)}</td>
+      <td class="${resultClass}">${b.result || 'pending'}</td>
+      <td class="${b.result ? cls(b.profit || 0) : ''}">${b.result ? fmt(b.profit || 0) : '-'}</td>
     </tr>`;
   });
   html += '</table>';
-  document.getElementById('recent').innerHTML = html;
+  document.getElementById('today').innerHTML = html;
 }
-fetch('api/recent').then(r => r.json()).then(data => {
-  _recentData = data;
+fetch('api/today_bets').then(r => r.json()).then(data => {
+  _todayData = data;
   const strategies = [...new Set(data.map(b => b.strategy_name))].sort();
-  const sel = document.getElementById('recentStrategyFilter');
+  const sel = document.getElementById('todayStrategyFilter');
   strategies.forEach(s => sel.insertAdjacentHTML('beforeend', `<option value="${s}">${s}</option>`));
-  renderRecent();
+  renderToday();
 });
 
 let profitChart = null;
@@ -818,6 +795,29 @@ document.write('<base href="' + (window.location.pathname.startsWith('/betdex') 
   .card h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin: 0 0 14px; }
   canvas { max-width: 100%; }
   .empty { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 30px 0; text-align: center; }
+  .card-controls { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .sub-tabs { display: flex; gap: 4px; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 3px; flex-wrap: wrap; }
+  .sub-tab { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); padding: 5px 10px; border-radius: 6px; cursor: pointer; user-select: none; white-space: nowrap; }
+  .sub-tab:hover { color: var(--text); }
+  .sub-tab.active { background: var(--accent); color: #0a0e14; font-weight: 700; }
+  select.control { background: var(--card2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-family: 'JetBrains Mono', monospace; font-size: 11px; max-width: 260px; }
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .stat { background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+  .stat-label { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stat-value { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 700; color: var(--text); }
+  .stat-sub { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--muted); margin-top: 3px; }
+  .pos { color: var(--win); }
+  .neg { color: var(--loss); }
+  .table-wrap { max-height: 360px; overflow-y: auto; margin-top: 18px; border: 1px solid var(--border); border-radius: 8px; }
+  table.tbl { width: 100%; border-collapse: collapse; font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+  table.tbl th { position: sticky; top: 0; background: var(--card2); color: var(--muted); font-weight: 600; text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--border); cursor: pointer; white-space: nowrap; z-index: 1; }
+  table.tbl th:first-child, table.tbl td:first-child { text-align: left; }
+  table.tbl th:hover { color: var(--text); }
+  table.tbl th.sorted { color: var(--accent); }
+  table.tbl td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--border); color: var(--text); white-space: nowrap; }
+  table.tbl tbody tr:last-child td { border-bottom: none; }
+  table.tbl tbody tr:hover { background: rgba(91, 141, 239, 0.06); }
+  .note { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 11px; margin-top: 12px; line-height: 1.6; }
 </style>
 </head>
 <body>
@@ -835,6 +835,44 @@ document.write('<base href="' + (window.location.pathname.startsWith('/betdex') 
   </div>
 
   <div class="grid">
+    <div class="card full">
+      <h2>Performance by Day of Week <span style="font-weight:400; text-transform:none; letter-spacing:0;">— Mon to Sun, Europe/Athens</span></h2>
+      <div class="card-controls">
+        <div class="sub-tabs" id="weekdayMetricTabs">
+          <div class="sub-tab active" data-metric="profit">Total Profit</div>
+          <div class="sub-tab" data-metric="avg_profit">Avg / Day</div>
+          <div class="sub-tab" data-metric="bets">Bets</div>
+          <div class="sub-tab" data-metric="win_rate">Win Rate</div>
+          <div class="sub-tab" data-metric="roi">ROI</div>
+        </div>
+        <select class="control" id="weekdayStrategyFilter"><option value="">All strategies</option></select>
+      </div>
+      <div class="stat-row" id="weekdayStats"></div>
+      <div id="weekdayChartWrap">
+        <canvas id="weekdayChart" height="90"></canvas>
+        <div class="empty" id="weekdayChartEmpty" style="display:none;">No settled bets yet</div>
+      </div>
+      <div class="table-wrap">
+        <table class="tbl" id="weekdayTable">
+          <thead><tr>
+            <th data-sort="weekday" data-label="Weekday">Weekday</th>
+            <th data-sort="days" data-label="Days">Days</th>
+            <th data-sort="bets" data-label="Bets">Bets</th>
+            <th data-sort="won" data-label="Won">Won</th>
+            <th data-sort="lost" data-label="Lost">Lost</th>
+            <th data-sort="win_rate" data-label="Win %">Win %</th>
+            <th data-sort="staked" data-label="Staked">Staked</th>
+            <th data-sort="profit" data-label="Profit">Profit</th>
+            <th data-sort="avg_profit" data-label="Avg / Day">Avg / Day</th>
+            <th data-sort="roi" data-label="ROI %">ROI %</th>
+            <th data-sort="avg_odds" data-label="Avg Odds">Avg Odds</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="note" id="weekdayNote"></div>
+    </div>
+
     <div class="card full">
       <h2>Cumulative Profit Over Time</h2>
       <canvas id="cumulativeChart" height="70"></canvas>
@@ -977,6 +1015,219 @@ fetch('api/chart_data').then(r => r.json()).then(data => {
     document.getElementById('profitPerLeagueChart').outerHTML = '<div class="empty">No league data yet — leagues are captured as new bets are placed</div>';
   }
 });
+
+// ---------------------------------------------------------------------------
+// Performance by Day of Week report
+// ---------------------------------------------------------------------------
+const weekdayMetrics = {
+  profit:     { label: 'Profit',    get: w => w.profit,     signed: true,  color: w => w.profit >= 0 ? win : loss },
+  avg_profit: { label: 'Avg / day', get: w => w.avg_profit, signed: true,  color: w => w.avg_profit >= 0 ? win : loss },
+  bets:       { label: 'Bets',      get: w => w.bets,       signed: false, color: () => accent },
+  win_rate:   { label: 'Win rate',  get: w => w.win_rate,   signed: false, color: () => accent },
+  roi:        { label: 'ROI',       get: w => w.roi,        signed: true,  color: w => w.roi >= 0 ? win : loss }
+};
+
+let weekdayChart = null;
+let weekdayData = { weekdays: [], summary: {} };
+let weekdaySort = { key: 'weekday', dir: 'asc' };
+
+function signed(n, dp) {
+  const d = dp === undefined ? 2 : dp;
+  return (Number(n) >= 0 ? '+' : '') + Number(n).toFixed(d);
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderWeekdayStats(s) {
+  const d = Object.assign({
+    profit: 0, staked: 0, bets: 0, won: 0, lost: 0,
+    win_rate: 0, roi: 0, avg_profit: 0, trading_days: 0
+  }, s || {});
+  const best = d.best_day, worst = d.worst_day, busy = d.busiest;
+  const tiles = [
+    { label: 'Best weekday', value: best ? best.name : '—', cls: 'pos', sub: best ? signed(best.avg_profit, 2) + ' / day' : '' },
+    { label: 'Worst weekday', value: worst ? worst.name : '—', cls: 'neg', sub: worst ? signed(worst.avg_profit, 2) + ' / day' : '' },
+    { label: 'Busiest', value: busy ? busy.name : '—', sub: busy ? busy.bets + ' bets' : '' },
+    { label: 'Net profit', value: signed(d.profit, 2), cls: d.profit >= 0 ? 'pos' : 'neg', sub: d.trading_days + ' trading days' },
+    { label: 'Win rate', value: Number(d.win_rate).toFixed(1) + '%', sub: d.won + 'W / ' + d.lost + 'L' },
+    { label: 'ROI', value: signed(d.roi, 1) + '%', cls: d.roi >= 0 ? 'pos' : 'neg' },
+    { label: 'Staked', value: Number(d.staked).toFixed(2), sub: d.bets + ' bets' },
+    { label: 'Avg / trading day', value: signed(d.avg_profit, 2), cls: d.avg_profit >= 0 ? 'pos' : 'neg' }
+  ];
+  document.getElementById('weekdayStats').innerHTML = tiles.map(t =>
+    '<div class="stat">' +
+      '<div class="stat-label">' + t.label + '</div>' +
+      '<div class="stat-value ' + (t.cls || '') + '">' + t.value + '</div>' +
+      (t.sub ? '<div class="stat-sub">' + t.sub + '</div>' : '') +
+    '</div>'
+  ).join('');
+}
+
+function drawWeekdayChart() {
+  const canvas = document.getElementById('weekdayChart');
+  const empty = document.getElementById('weekdayChartEmpty');
+  if (!canvas) return;
+  const rows = weekdayData.weekdays || [];
+  if (!rows.length || !rows.some(r => r.bets > 0)) {
+    if (weekdayChart) { weekdayChart.destroy(); weekdayChart = null; }
+    canvas.style.display = 'none';
+    if (empty) empty.style.display = 'block';
+    return;
+  }
+  canvas.style.display = '';
+  if (empty) empty.style.display = 'none';
+
+  const activeTab = document.querySelector('#weekdayMetricTabs .sub-tab.active');
+  const metric = activeTab ? activeTab.dataset.metric : 'profit';
+  const cfg = weekdayMetrics[metric] || weekdayMetrics.profit;
+  const values = rows.map(cfg.get);
+  const colors = rows.map(cfg.color);
+
+  if (weekdayChart) { weekdayChart.destroy(); weekdayChart = null; }
+  weekdayChart = new Chart(canvas, {
+    type: 'bar',
+    data: { labels: rows.map(w => w.name), datasets: [{ data: values, backgroundColor: colors, borderRadius: 4 }] },
+    options: {
+      plugins: {
+        legend: { display: false },
+        datalabels: {
+          color: '#e4e7ec',
+          font: { family: 'JetBrains Mono', size: 11, weight: '600' },
+          anchor: 'end',
+          align: 'end',
+          formatter: v => cfg.signed ? signed(v, 2) : (metric === 'bets' ? String(v) : Number(v).toFixed(1))
+        },
+        tooltip: {
+          callbacks: {
+            label: item => {
+              const w = rows[item.dataIndex];
+              return [
+                'Profit: ' + signed(w.profit, 2) + '  (' + signed(w.avg_profit, 2) + ' / day)',
+                'Bets: ' + w.bets + '  (' + w.won + 'W / ' + w.lost + 'L)',
+                'Win rate: ' + Number(w.win_rate).toFixed(1) + '%',
+                'ROI: ' + signed(w.roi, 1) + '%',
+                'Trading days: ' + w.days
+              ];
+            }
+          }
+        }
+      },
+      scales: {
+        x: { grid: baseGrid, ticks: { ...baseTicks, maxRotation: 0 } },
+        y: { grid: baseGrid, ticks: baseTicks }
+      }
+    }
+  });
+}
+
+function renderWeekdayTable() {
+  const tbody = document.querySelector('#weekdayTable tbody');
+  if (!tbody) return;
+  const rows = (weekdayData.weekdays || []).slice();
+  const key = weekdaySort.key;
+  const dir = weekdaySort.dir === 'asc' ? 1 : -1;
+  rows.sort((a, b) => {
+    const av = a[key], bv = b[key];
+    if (typeof av === 'string' || typeof bv === 'string') {
+      // plain comparison, not localeCompare — ISO dates must sort as strings
+      return dir * (av < bv ? -1 : (av > bv ? 1 : 0));
+    }
+    return dir * (av - bv);
+  });
+  tbody.innerHTML = rows.map(w =>
+    '<tr>' +
+      '<td>' + w.name + '</td>' +
+      '<td>' + w.days + '</td>' +
+      '<td>' + w.bets + '</td>' +
+      '<td>' + w.won + '</td>' +
+      '<td>' + w.lost + '</td>' +
+      '<td>' + Number(w.win_rate).toFixed(1) + '%</td>' +
+      '<td>' + Number(w.staked).toFixed(2) + '</td>' +
+      '<td class="' + (w.profit >= 0 ? 'pos' : 'neg') + '">' + signed(w.profit, 2) + '</td>' +
+      '<td class="' + (w.avg_profit >= 0 ? 'pos' : 'neg') + '">' + signed(w.avg_profit, 2) + '</td>' +
+      '<td class="' + (w.roi >= 0 ? 'pos' : 'neg') + '">' + signed(w.roi, 1) + '%</td>' +
+      '<td>' + Number(w.avg_odds).toFixed(2) + '</td>' +
+    '</tr>'
+  ).join('');
+
+  document.querySelectorAll('#weekdayTable th[data-sort]').forEach(th => {
+    const on = th.dataset.sort === key;
+    th.classList.toggle('sorted', on);
+    const base = th.dataset.label || th.dataset.sort;
+    th.textContent = base + (on ? (weekdaySort.dir === 'asc' ? ' ▲' : ' ▼') : '');
+  });
+}
+
+function fillWeekdayStrategies(list) {
+  const sel = document.getElementById('weekdayStrategyFilter');
+  if (!sel || !list || !list.length) return;
+  const current = sel.value;
+  if (sel.dataset.filled === '1' && sel.options.length === list.length + 1) return;
+  sel.innerHTML = '<option value="">All strategies</option>' +
+    list.map(s => '<option value="' + escHtml(s) + '">' + escHtml(s) + '</option>').join('');
+  sel.value = current;
+  sel.dataset.filled = '1';
+}
+
+function loadWeekday() {
+  const sel = document.getElementById('weekdayStrategyFilter');
+  const strategy = sel ? sel.value : '';
+  const note = document.getElementById('weekdayNote');
+  if (note) note.textContent = 'Loading…';
+
+  fetch('api/weekday_performance?strategy=' + encodeURIComponent(strategy))
+    .then(r => r.json())
+    .then(data => {
+      weekdayData = data || { weekdays: [] };
+      fillWeekdayStrategies(data.strategies);
+      renderWeekdayStats(data.summary || {});
+      drawWeekdayChart();
+      renderWeekdayTable();
+      if (note) {
+        note.textContent =
+          'A weekday bucket spans many weeks, so totals alone favour the weekdays that happened to occur most often.'
+          + ' Avg / Day divides by the trading days in the Days column.'
+          + ' Days are Europe/Athens calendar days in which bets settled.'
+          + (strategy ? ' Filtered to "' + strategy + '".' : '')
+          + ' Click a column header to sort.';
+      }
+    })
+    .catch(e => {
+      if (note) note.textContent = 'Could not load weekday performance: ' + e;
+    });
+}
+
+document.querySelectorAll('#weekdayMetricTabs .sub-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('#weekdayMetricTabs .sub-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    drawWeekdayChart();
+  });
+});
+
+document.querySelectorAll('#weekdayTable th[data-sort]').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.dataset.sort;
+    if (weekdaySort.key === key) {
+      weekdaySort.dir = weekdaySort.dir === 'asc' ? 'desc' : 'asc';
+    } else {
+      weekdaySort.key = key;
+      weekdaySort.dir = 'asc';
+    }
+    renderWeekdayTable();
+  });
+});
+
+const weekdaySelect = document.getElementById('weekdayStrategyFilter');
+if (weekdaySelect) weekdaySelect.addEventListener('change', loadWeekday);
+
+loadWeekday();
 </script>
 </body>
 </html>
@@ -1073,6 +1324,10 @@ document.write('<base href="' + (window.location.pathname.startsWith('/betdex') 
         <button class="btn small" onclick="selectAllLeagues()">Select all</button>
         <button class="btn small" onclick="clearAllLeagues()">Clear</button>
       </div>
+      <div id="leagueFilterRow" style="display:none;">
+        <input type="text" id="leagueFilter" placeholder="Filter leagues (checked ones stay visible)…" oninput="filterLeagueList(this.value)" style="margin-bottom:10px;">
+      </div>
+      <div id="leagueNoMatch" style="display:none; color:var(--muted); font-size:12px;">No leagues match that filter.</div>
       <div id="leagueList" class="scroll-panel"></div>
     </div>
     <div class="card">
@@ -1086,8 +1341,18 @@ function toggleNav() { document.getElementById('navLinks').classList.toggle('ope
 if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/service-worker.js').catch(() => {}); }
 let leagues = [];
 let categories = {};
-let currentSport = 'Soccer';
+let currentSport = 'All';
 let collapsedCats = new Set();
+
+// League/category names come from the API and from user input, so they
+// get escaped before going into innerHTML.
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function setLeagueListTitle() {
+  document.getElementById('leagueListTitle').textContent =
+    currentSport === 'All' ? 'All Leagues' : `All Leagues — ${currentSport}`;
+}
 
 function toggleCatCollapse(cat, safeCat) {
   if (collapsedCats.has(cat)) {
@@ -1103,15 +1368,31 @@ function toggleCatCollapse(cat, safeCat) {
 
 function switchSport() {
   currentSport = document.getElementById('sportSelector').value;
-  document.getElementById('leagueListTitle').textContent = `All Leagues — ${currentSport}`;
+  setLeagueListTitle();
   loadLeaguesForSport();
 }
 
 function loadLeaguesForSport() {
   fetch('api/leagues?sport=' + encodeURIComponent(currentSport)).then(r => r.json()).then(l => {
     leagues = (l || []).slice().sort((a, b) => a.localeCompare(b));
+    const f = document.getElementById('leagueFilter');
+    if (f) f.value = '';
     render();
   });
+}
+
+// Checked leagues stay visible regardless of the filter, so a filter
+// can't hide a selection from bulkAdd.
+function filterLeagueList(term) {
+  const t = (term || '').trim().toLowerCase();
+  let shown = 0;
+  document.querySelectorAll('#leagueList .league-item').forEach(row => {
+    const cb = row.querySelector('.league-check');
+    const match = !t || !cb || cb.value.toLowerCase().includes(t) || (cb && cb.checked);
+    row.style.display = match ? '' : 'none';
+    if (match) shown++;
+  });
+  document.getElementById('leagueNoMatch').style.display = shown ? 'none' : '';
 }
 
 function load(keepSport) {
@@ -1125,9 +1406,9 @@ function load(keepSport) {
     if (keepSport && list.includes(currentSport)) {
       sel.value = currentSport;
     } else {
-      currentSport = sel.value || 'Soccer';
+      currentSport = sel.value || 'All';
     }
-    document.getElementById('leagueListTitle').textContent = `All Leagues — ${currentSport}`;
+    setLeagueListTitle();
 
     categories = c || {};
     Object.keys(categories).forEach(cat => {
@@ -1149,10 +1430,11 @@ function render() {
   leagues.forEach(name => {
     leagueHtml += `<div class="league-item">
       <input type="checkbox" class="league-check" value="${escAttr(name)}">
-      <span style="flex:1;">${name}</span>
+      <span style="flex:1;">${escHtml(name)}</span>
     </div>`;
   });
-  document.getElementById('leagueList').innerHTML = leagueHtml || '<p style="color:var(--muted);">No leagues captured yet.</p>';
+  document.getElementById('leagueList').innerHTML = leagueHtml || '<p style="color:var(--muted);">No leagues known yet — the collector picks them up as markets open.</p>';
+  document.getElementById('leagueFilterRow').style.display = leagues.length ? '' : 'none';
 
   let catHtml = '';
   catNames.forEach(cat => {
@@ -1162,7 +1444,7 @@ function render() {
     catHtml += `<div class="cat-block">
       <div class="cat-title-row" onclick="toggleCatCollapse('${escName(cat)}','${safeCat}')">
         <span class="cat-toggle">${isCollapsed ? '▸' : '▾'}</span>
-        <div class="cat-title" style="flex:1;">${cat} (${inCat.length})</div>
+        <div class="cat-title" style="flex:1;">${escHtml(cat)} (${inCat.length})</div>
         <div class="cat-actions" onclick="event.stopPropagation()">
           <button class="btn small" onclick="copyCategory('${escName(cat)}')">Copy</button>
           <button class="btn small danger" onclick="deleteCategory('${escName(cat)}')">Delete</button>
@@ -1171,7 +1453,7 @@ function render() {
       <div id="catbody_${safeCat}" style="display:${isCollapsed ? 'none' : ''};">
         ${inCat.map(l => `<div class="cat-league-row">
             <input type="checkbox" class="rm_${safeCat}" value="${escAttr(l)}">
-            <span>${l}</span>
+            <span>${escHtml(l)}</span>
           </div>`).join('') || '<span style="color:var(--muted); font-size:12px;">(empty)</span>'}
         ${inCat.length ? `<button class="btn small danger cat-bulk-remove" onclick="bulkRemove('${escName(cat)}','${safeCat}')">Remove checked</button>` : ''}
       </div>
@@ -1559,14 +1841,28 @@ function saveGlobalRiskRules() {
 }
 
 // ---------- Leagues / categories ----------
-function fetchLeagueData(rerender) {
-  Promise.all([
+// Loaded once per page and cached, so the modal always renders from a
+// fresh copy. leagueDataOk guards saveStrategy: if this never loaded,
+// the checkboxes render empty and saving would silently wipe a
+// strategy's league filter.
+let leagueDataPromise = null;
+let leagueDataOk = false;
+function escHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function fetchLeagueData() {
+  if (leagueDataPromise) return leagueDataPromise;
+  leagueDataPromise = Promise.all([
     fetch('api/leagues').then(r => r.json()),
     fetch('api/league_categories').then(r => r.json())
   ]).then(([l, c]) => {
     allLeagues = Array.isArray(l) ? l : [];
     allCategories = c || {};
+    leagueDataOk = true;
+  }).catch(err => {
+    leagueDataPromise = null;   // drop it so the next call retries
+    leagueDataOk = false;
+    throw err;
   });
+  return leagueDataPromise;
 }
 function renderCategoryCheckboxes(containerId, selected) {
   const box = document.getElementById(containerId);
@@ -1577,24 +1873,52 @@ function renderCategoryCheckboxes(containerId, selected) {
     const id = containerId + '_' + cat.replace(/[^a-zA-Z0-9]/g,'_');
     return `<div class="checkbox-row" style="margin-bottom:4px;">
       <input type="checkbox" id="${id}" data-category="${cat.replace(/"/g,'&quot;')}" ${checked}>
-      <label for="${id}" style="margin:0; font-family:'JetBrains Mono', monospace; font-size:12px;">${cat} (${(allCategories[cat]||[]).length})</label>
+      <label for="${id}" style="margin:0; font-family:'JetBrains Mono', monospace; font-size:12px;">${escHtml(cat)} (${(allCategories[cat]||[]).length})</label>
     </div>`;
   }).join('');
 }
 function renderLeagueCheckboxes(containerId, selected) {
   const box = document.getElementById(containerId);
-  if (!allLeagues.length) { box.innerHTML = '<span style="color:var(--muted); font-size:12px;">No leagues seen yet.</span>'; return; }
-  box.innerHTML = allLeagues.map(name => {
+  if (!allLeagues.length) { box.innerHTML = '<span style="color:var(--muted); font-size:12px;">No leagues known yet.</span>'; return; }
+  box.innerHTML = `<input type="text" id="${containerId}_filter" placeholder="Filter leagues…" oninput="filterChecks('${containerId}', this.value)" style="width:100%; margin-bottom:6px;">` +
+    allLeagues.map(name => {
     const checked = selected.includes(name) ? 'checked' : '';
     const id = containerId + '_' + name.replace(/[^a-zA-Z0-9]/g,'_');
     return `<div class="checkbox-row" style="margin-bottom:4px;">
       <input type="checkbox" id="${id}" data-league="${name.replace(/"/g,'&quot;')}" ${checked}>
-      <label for="${id}" style="margin:0; font-family:'JetBrains Mono', monospace; font-size:12px;">${name}</label>
+      <label for="${id}" style="margin:0; font-family:'JetBrains Mono', monospace; font-size:12px;">${escHtml(name)}</label>
     </div>`;
   }).join('');
 }
-function getCheckedCategories(containerId) {
-  return Array.from(document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`)).map(el => el.dataset.category);
+// Hides checkbox rows that don't match — checked ones are always kept
+// visible so a filter can never hide (and thus silently drop) a selection.
+function filterChecks(containerId, term) {
+  const box = document.getElementById(containerId);
+  const checkboxes = Array.from(box.querySelectorAll('input[type="checkbox"]'));
+  const t = (term || '').trim().toLowerCase();
+  let shown = 0;
+  checkboxes.forEach(cb => {
+    const row = cb.parentElement;
+    const text = (cb.dataset.category || cb.dataset.league || '').toLowerCase();
+    const match = !t || text.includes(t) || cb.checked;
+    row.style.display = match ? '' : 'none';
+    if (match) shown++;
+  });
+  let msg = document.getElementById(containerId + '_nomatch');
+  if (!shown) {
+    if (!msg) {
+      msg = document.createElement('div');
+      msg.id = containerId + '_nomatch';
+      msg.style.cssText = 'color:var(--muted); font-size:12px;';
+      msg.textContent = 'No leagues match that filter.';
+      box.appendChild(msg);
+    }
+  } else if (msg) {
+    msg.remove();
+  }
+}
+
+function getCheckedCategories(containerId) {  return Array.from(document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`)).map(el => el.dataset.category);
 }
 function getCheckedLeagues(containerId) {
   return Array.from(document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`)).map(el => el.dataset.league);
@@ -1613,9 +1937,20 @@ function fetchStrategies() {
     renderList();
   });
 }
+function sortedStrategies() {
+  return strategies
+    .map((s, i) => ({ s, i }))
+    .sort((a, b) => {
+      // active first, then inactive
+      const aRank = a.s.enabled ? 0 : 1;
+      const bRank = b.s.enabled ? 0 : 1;
+      if (aRank !== bRank) return aRank - bRank;
+      return String(a.s.name || '').localeCompare(String(b.s.name || ''), undefined, { sensitivity: 'base' });
+    });
+}
 function renderList() {
   let html = '';
-  strategies.forEach((s, i) => {
+  sortedStrategies().forEach(({ s, i }) => {
     const badgeClass = s.enabled ? 'on' : 'off';
     const badgeText = s.enabled ? 'ACTIVE' : 'INACTIVE';
     let metaLine;
@@ -1759,8 +2094,15 @@ function openModal(index) {
   document.getElementById('f_flashscore_min_step').value = s.flashscore_min_step ?? '';
   onFlashscoreToggle();
 
-  renderCategoryCheckboxes('f_tab_categories', s.included_categories || []);
-  renderLeagueCheckboxes('f_tab_leagues', s.included_leagues || []);
+  const leagueCats = s.included_categories || [], leagueFallback = s.included_leagues || [];
+  fetchLeagueData().then(() => {
+    renderCategoryCheckboxes('f_tab_categories', leagueCats);
+    renderLeagueCheckboxes('f_tab_leagues', leagueFallback);
+  }).catch(() => {
+    document.getElementById('f_tab_categories').innerHTML =
+      '<span style="color:var(--loss); font-size:12px;">Could not load leagues/categories — close this dialog and reopen it before saving.</span>';
+    document.getElementById('f_tab_leagues').innerHTML = '';
+  });
   switchTab('f', 'f_tab_categories');
 
   document.getElementById('f_enabled').checked = s.enabled !== false;
@@ -1793,6 +2135,10 @@ function saveStrategy() {
     if (!Number.isInteger(flashscoreMinStep) || flashscoreMinStep < 1) { showError('Flashscore step must be 1 or higher.'); return; }
   }
 
+  if (!leagueDataOk) {
+    showError('The league/category list never loaded — reload the page and reopen this dialog, otherwise the league filter would be saved empty.');
+    return;
+  }
   const checkedCategories = getCheckedCategories('f_tab_categories');
   const checkedLeagues = getCheckedLeagues('f_tab_leagues');
 
@@ -1893,7 +2239,7 @@ function restartBot() {
 }
 
 fetchGlobalRiskRules();
-fetchLeagueData();
+fetchLeagueData().catch(() => {});   // warm the cache; openModal retries on failure
 fetchStrategies();
 </script>
 </body>
@@ -1907,10 +2253,26 @@ def _to_athens(iso_str):
         return iso_str
     try:
         dt = datetime.fromisoformat(iso_str)
-        dt = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Europe/Athens"))
+        dt = dt.replace(tzinfo=UTC_TZ).astimezone(ATHENS_TZ)
         return dt.strftime("%Y-%m-%dT%H:%M:%S")
     except Exception:
         return iso_str
+
+
+def _local_day(iso_str):
+    """Naive-UTC ISO timestamp -> local calendar day (Europe/Athens).
+
+    Returns a 'YYYY-MM-DD' string, or None when the value is unusable.
+    """
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC_TZ)
+    return dt.astimezone(ATHENS_TZ).strftime("%Y-%m-%d")
 
 
 def query(sql, params=()):
@@ -1957,6 +2319,38 @@ def analytics_page():
 @require_password
 def categories_page():
     return render_template_string(CATEGORIES_PAGE, build=BUILD_VERSION)
+
+
+@app.route("/api/balance")
+@require_password
+def api_balance():
+    """BetDEX wallet balance (live from the exchange).
+
+    Cached for BALANCE_TTL seconds so a page reload doesn't log in and
+    hit the API every time. Failures return ok=False with the reason
+    instead of an error status, so the tile on the dashboard can just
+    show a dash.
+    """
+    now = time.time()
+    with _balance_lock:
+        cached = _balance_cache.get("data")
+        if cached is not None and now - _balance_cache.get("at", 0) < BALANCE_TTL:
+            return jsonify(cached)
+
+    if not os.environ.get("BETDEX_WALLET_ID") or not os.environ.get("BETDEX_API_KEY"):
+        data = {"ok": False, "error": "BetDEX credentials not configured for the dashboard."}
+    else:
+        client = BetdexClient()
+        bal = client.get_wallet_balance()
+        if bal:
+            data = {"ok": True, **bal, "fetched_at": datetime.utcnow().isoformat() + "Z"}
+        else:
+            data = {"ok": False, "error": "Could not read the BetDEX wallet."}
+
+    with _balance_lock:
+        _balance_cache["data"] = data
+        _balance_cache["at"] = now
+    return jsonify(data)
 
 
 @app.route("/api/summary")
@@ -2019,149 +2413,150 @@ def _read_balance_for_strategy(name):
     return None, False
 
 
-def _strategy_group_map():
-    """Maps each strategy to a market-type group so many similar strategies
-    merge into one combined view: Win, GG, Total Over, Total Under,
-    Double Chance, or Other.
-    """
-    mapping = {}
-    if not os.path.isfile(STRATEGIES_FILE):
-        return mapping
-    try:
-        with open(STRATEGIES_FILE, encoding="utf-8") as f:
-            all_strategies = json.load(f).get("strategies", [])
-    except Exception:
-        return mapping
-
-    def group_for(market_type_id, total_direction):
-        mt = (market_type_id or "").upper()
-        if "DOUBLE_CHANCE" in mt:
-            return "Double Chance"
-        if "BOTH_TEAMS_TO_SCORE" in mt:
-            return "GG"
-        if "OVER_UNDER" in mt:
-            d = (total_direction or "").strip().lower()
-            if d == "over":
-                return "Total Over"
-            if d == "under":
-                return "Total Under"
-            return "Total"
-        if any(k in mt for k in ("FULL_TIME_RESULT", "MONEYLINE", "WINNER", "HALF_TIME_RESULT")):
-            return "Win"
-        return market_type_id or "Other"
-
-    for s in all_strategies:
-        name = s.get("name")
-        if not name:
-            continue
-        if s.get("strategy_mode") == "multi_market":
-            configs = s.get("market_configs") or []
-            first = configs[0] if configs else {}
-            mapping[name] = group_for(first.get("market_type_id"), first.get("total_direction"))
-        else:
-            mapping[name] = group_for(s.get("market_type_id"), s.get("total_direction"))
-
-    return mapping
-
-
-@app.route("/api/strategy_league_breakdown")
-@require_password
-def strategy_league_breakdown():
-    rows = query("""
-        SELECT strategy_name, league,
-               COUNT(*) as total,
-               SUM(CASE WHEN result = 'won' THEN 1 ELSE 0 END) as won,
-               SUM(CASE WHEN result = 'lost' THEN 1 ELSE 0 END) as lost,
-               COALESCE(SUM(profit), 0) as profit
-        FROM bets
-        WHERE result IS NOT NULL AND league IS NOT NULL
-        GROUP BY strategy_name, league
-        ORDER BY strategy_name, profit ASC
-    """)
-    for r in rows:
-        r["win_rate"] = round(100 * r["won"] / r["total"], 1) if r["total"] else 0
-    return jsonify(rows)
-
-
-@app.route("/api/group_league_breakdown")
-@require_password
-def group_league_breakdown():
-    """Same data as /api/strategy_league_breakdown, but merged across
-    all strategies that share the same market-type group (Win, GG,
-    Total Over, Total Under, Double Chance), so you see one combined
-    per-league picture instead of one row per individual strategy.
-    """
-    rows = query("""
-        SELECT strategy_name, league,
-               COUNT(*) as total,
-               SUM(CASE WHEN result = 'won' THEN 1 ELSE 0 END) as won,
-               SUM(CASE WHEN result = 'lost' THEN 1 ELSE 0 END) as lost,
-               COALESCE(SUM(profit), 0) as profit
-        FROM bets
-        WHERE result IS NOT NULL AND league IS NOT NULL
-        GROUP BY strategy_name, league
-    """)
-
-    group_map = _strategy_group_map()
-    merged = {}
-    for r in rows:
-        group = group_map.get(r["strategy_name"], "Other")
-        key = (group, r["league"])
-        if key not in merged:
-            merged[key] = {"group_name": group, "league": r["league"], "total": 0, "won": 0, "lost": 0, "profit": 0.0}
-        merged[key]["total"] += r["total"]
-        merged[key]["won"] += r["won"]
-        merged[key]["lost"] += r["lost"]
-        merged[key]["profit"] += r["profit"]
-
-    result = list(merged.values())
-    for r in result:
-        r["win_rate"] = round(100 * r["won"] / r["total"], 1) if r["total"] else 0
-        r["profit"] = round(r["profit"], 2)
-    result.sort(key=lambda r: (r["group_name"], r["profit"]))
-    return jsonify(result)
-
-
-@app.route("/api/steps")
-@require_password
-def steps():
-    rows = query("""
-        SELECT strategy_name, step, COUNT(*) as count
-        FROM bets
-        WHERE strategy_name IN (
-            SELECT strategy_name FROM bets GROUP BY strategy_name HAVING MAX(step) > 1
-        )
-        GROUP BY strategy_name, step
-        ORDER BY strategy_name, step
-    """)
-    return jsonify(rows)
-
-
 @app.route("/api/profit_periods")
 @require_password
 def profit_periods():
-    daily = query("""
-        SELECT date(settled_at) as period, COALESCE(SUM(profit), 0) as profit
+    """Profit per day / month / year.
+
+    Bucketed by the day the bet was PLACED, in Athens time - the same basis
+    as the Today's Bets table, so the two always add up.
+    """
+    rows = query("""
+        SELECT placed_at, profit
         FROM bets
-        WHERE result IS NOT NULL AND date(settled_at) >= date('now', '-6 days')
-        GROUP BY period
-        ORDER BY period
+        WHERE result IS NOT NULL AND placed_at IS NOT NULL
     """)
-    monthly = query("""
-        SELECT strftime('%Y-%m', settled_at) as period, COALESCE(SUM(profit), 0) as profit
+
+    daily, monthly, yearly = {}, {}, {}
+    for r in rows:
+        day = _local_day(r["placed_at"])
+        if not day:
+            continue
+        profit = float(r["profit"] or 0)
+        daily[day] = daily.get(day, 0.0) + profit
+        monthly[day[:7]] = monthly.get(day[:7], 0.0) + profit
+        yearly[day[:4]] = yearly.get(day[:4], 0.0) + profit
+
+    cutoff = (datetime.now(ATHENS_TZ).date() - timedelta(days=6)).isoformat()
+    return jsonify({
+        "daily": [{"period": d, "profit": round(p, 4)} for d, p in sorted(daily.items()) if d >= cutoff],
+        "monthly": [{"period": m, "profit": round(p, 4)} for m, p in sorted(monthly.items())],
+        "yearly": [{"period": y, "profit": round(p, 4)} for y, p in sorted(yearly.items())],
+    })
+
+
+WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _empty_weekday_bucket(wd):
+    return {
+        "weekday": wd,
+        "name": WEEKDAY_NAMES[wd],
+        "bets": 0,
+        "won": 0,
+        "lost": 0,
+        "profit": 0.0,
+        "staked": 0.0,
+        "price_sum": 0.0,
+        "price_count": 0,
+        "dates": set(),
+    }
+
+
+@app.route("/api/weekday_performance")
+@require_password
+def weekday_performance():
+    """Performance broken down by day of the week (Mon..Sun).
+
+    A weekday bucket spans many weeks, so the raw total is misleading: a
+    weekday that happened to fall on more trading days shows more profit.
+    Both the total and the average per occurrence are reported.
+    """
+    strategy = (request.args.get("strategy") or "").strip()
+
+    sql = """
+        SELECT settled_at, strategy_name, price, stake, result, profit
         FROM bets
         WHERE result IS NOT NULL
-        GROUP BY period
-        ORDER BY period
-    """)
-    yearly = query("""
-        SELECT strftime('%Y', settled_at) as period, COALESCE(SUM(profit), 0) as profit
-        FROM bets
-        WHERE result IS NOT NULL
-        GROUP BY period
-        ORDER BY period
-    """)
-    return jsonify({"daily": daily, "monthly": monthly, "yearly": yearly})
+    """
+    params = []
+    if strategy:
+        sql += " AND strategy_name = ?"
+        params.append(strategy)
+    rows = query(sql, tuple(params))
+
+    buckets = {i: _empty_weekday_bucket(i) for i in range(7)}
+    for r in rows:
+        day = _local_day(r["settled_at"])
+        if not day:
+            continue
+        b = buckets[datetime.fromisoformat(day).weekday()]  # 0=Mon .. 6=Sun
+        b["bets"] += 1
+        b["dates"].add(day)
+        if r["result"] == "won":
+            b["won"] += 1
+        elif r["result"] == "lost":
+            b["lost"] += 1
+        b["profit"] += float(r["profit"] or 0)
+        b["staked"] += float(r["stake"] or 0)
+        if r["price"] is not None:
+            b["price_sum"] += float(r["price"])
+            b["price_count"] += 1
+
+    weekdays = []
+    for wd in range(7):
+        b = buckets[wd]
+        days = len(b["dates"])
+        b["days"] = days
+        del b["dates"]
+        decided = b["won"] + b["lost"]
+        b["win_rate"] = round(100 * b["won"] / decided, 1) if decided else 0.0
+        b["roi"] = round(100 * b["profit"] / b["staked"], 1) if b["staked"] else 0.0
+        b["avg_odds"] = round(b["price_sum"] / b["price_count"], 2) if b["price_count"] else 0.0
+        b["profit"] = round(b["profit"], 4)
+        b["staked"] = round(b["staked"], 4)
+        b["avg_profit"] = round(b["profit"] / days, 4) if days else 0.0
+        b["avg_bets"] = round(b["bets"] / days, 1) if days else 0.0
+        weekdays.append(b)
+
+    active = [w for w in weekdays if w["days"] > 0]
+    total_profit = round(sum(w["profit"] for w in weekdays), 4)
+    total_staked = round(sum(w["staked"] for w in weekdays), 4)
+    total_bets = sum(w["bets"] for w in weekdays)
+    total_won = sum(w["won"] for w in weekdays)
+    total_lost = sum(w["lost"] for w in weekdays)
+    total_days = sum(w["days"] for w in weekdays)
+
+    best = max(active, key=lambda w: w["avg_profit"]) if active else None
+    worst = min(active, key=lambda w: w["avg_profit"]) if active else None
+    busiest = max(active, key=lambda w: w["bets"]) if active else None
+
+    strategies = [r["strategy_name"] for r in query("""
+        SELECT DISTINCT strategy_name FROM bets
+        WHERE strategy_name IS NOT NULL
+        ORDER BY strategy_name
+    """)]
+
+    return jsonify({
+        "weekdays": weekdays,
+        "summary": {
+            "profit": total_profit,
+            "staked": total_staked,
+            "bets": total_bets,
+            "won": total_won,
+            "lost": total_lost,
+            "win_rate": round(100 * total_won / (total_won + total_lost), 1) if (total_won + total_lost) else 0.0,
+            "roi": round(100 * total_profit / total_staked, 1) if total_staked else 0.0,
+            "avg_profit": round(total_profit / total_days, 4) if total_days else 0.0,
+            "trading_days": total_days,
+            "best_day": best,
+            "worst_day": worst,
+            "busiest": busiest,
+        },
+        "strategy": strategy,
+        "strategies": strategies,
+        "timezone": "Europe/Athens",
+    })
 
 
 @app.route("/api/chart_data")
@@ -2261,28 +2656,32 @@ def pending():
     return jsonify(rows)
 
 
-@app.route("/api/recent")
+@app.route("/api/today_bets")
 @require_password
-def recent():
+def today_bets():
+    """The bets placed today (Athens day), settled or still open."""
+    start_local = datetime.now(ATHENS_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_local.astimezone(UTC_TZ).strftime("%Y-%m-%dT%H:%M:%S")
     rows = query("""
         SELECT *, price AS odds FROM bets
-        WHERE result IS NOT NULL
+        WHERE placed_at >= ?
         ORDER BY placed_at DESC
-        LIMIT 50
-    """)
+    """, (start_utc,))
+    for r in rows:
+        r["placed_at"] = _to_athens(r.get("placed_at"))
     return jsonify(rows)
 
 
 @app.route("/api/leagues")
 @require_password
 def get_leagues():
-    return jsonify(get_seen_leagues())
+    return jsonify(get_seen_leagues(request.args.get("sport", "All")))
 
 
 @app.route("/api/leagues_sports")
 @require_password
 def get_leagues_sports():
-    return jsonify(["All"])
+    return jsonify(get_league_sports())
 
 
 @app.route("/api/league_categories", methods=["GET"])
