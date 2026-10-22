@@ -1,0 +1,36 @@
+{
+  "current_step": 1,
+  "active_bets": [
+    {
+      "order_id": "390331451",
+      "market_id": "2286658",
+      "event_id": "69261",
+      "lock_at": "2026-10-22T16:30:00",
+      "start_time": "2026-10-22T14:30:00",
+      "placed_at": "2026-10-22T11:30:05.013014",
+      "selection_name": "Over 2.5",
+      "event_name": "FC Kairat Almaty v Panathinaikos Athens",
+      "league": "UEFA Conference League",
+      "stake": 0.1,
+      "price": 1.84,
+      "step": 1,
+      "record_id": 191
+    },
+    {
+      "order_id": "390726979",
+      "market_id": "2287115",
+      "event_id": "69271",
+      "lock_at": "2026-10-22T18:45:00",
+      "start_time": "2026-10-22T16:45:00",
+      "placed_at": "2026-10-22T15:45:39.946024",
+      "selection_name": "Over 2.5",
+      "event_name": "KKS Lech Poznan v Sunderland AFC",
+      "league": "UEFA Europa League",
+      "stake": 0.1,
+      "price": 1.75,
+      "step": 1,
+      "record_id": 199
+    }
+  ],
+  "balance": null
+}
