@@ -51,6 +51,10 @@ def resolve_included_leagues(strategy):
 
     Returns None if the strategy has no categories and no individual
     leagues set — meaning "no filter, bet any league" (old behavior).
+
+    A filter that names a category which doesn't exist (typo, or the
+    category was deleted) resolves to fewer leagues than intended, so it
+    warns here rather than letting the strategy quietly bet on nothing.
     """
     included_categories = strategy.get("included_categories") or []
     included_leagues = strategy.get("included_leagues") or []
@@ -60,8 +64,18 @@ def resolve_included_leagues(strategy):
 
     categories = load_categories()
     allowed = set(included_leagues)
+    unknown = sorted(c for c in included_categories if c not in categories)
     for cat_name in included_categories:
         allowed.update(categories.get(cat_name, []))
+
+    name = strategy.get("name", "?")
+    if unknown:
+        print(f"[{name}] ⚠️ League categorie(s) not in league_categories.json: "
+              f"{', '.join(unknown)} — add them on the dashboard's Leagues page.")
+    if not allowed:
+        print(f"[{name}] ⚠️ League filter resolved to ZERO leagues"
+              f"{' (every category above is unknown or empty)' if unknown else ''} — "
+              f"this strategy will not bet until a category or league is added.")
 
     return allowed
 
