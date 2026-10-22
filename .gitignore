@@ -22,3 +22,5 @@ Thumbs.db
 
 logs/*.log
 logs/*.log.*
+
+data/backups/
