@@ -17,6 +17,10 @@ import json
 from datetime import datetime, timedelta
 
 
+# Currency ids returned by BetDEX for the wallet balances.
+CURRENCY_SYMBOLS = {"1": "USDC", "2": "USDT"}
+
+
 class BetdexClient:
     def __init__(self):
         self.app_id = os.getenv("BETDEX_APP_ID")
@@ -184,6 +188,43 @@ class BetdexClient:
             return None
         except Exception as e:
             print(f"Exception during order submission: {str(e)}")
+            return None
+
+    def get_wallet_balance(self, wallet_id=None):
+        """GET /wallets/{id} — balance for one currency on the wallet.
+
+        Returns a dict with balance / available / exposure, or None when
+        the wallet or its balances can't be read.
+        """
+        self.ensure_valid_session()
+        wid = wallet_id or self.wallet_id
+        url = f"{self.base_url}/wallets/{wid}"
+        try:
+            response = requests.get(url, headers=self.headers)
+            if response.status_code == 401:
+                if self.login():
+                    response = requests.get(url, headers=self.headers)
+            if response.status_code != 200:
+                return None
+            wallets = (response.json() or {}).get("wallets") or []
+            if not wallets:
+                return None
+            balances = wallets[0].get("balances") or []
+            if not balances:
+                return None
+            b = balances[0]
+            currency_id = str(b.get("currencyId") or "")
+            return {
+                "wallet_id": wallets[0].get("id"),
+                "currency_id": currency_id,
+                "currency": CURRENCY_SYMBOLS.get(currency_id, currency_id),
+                "balance": float(b.get("balance") or 0),
+                "available": float(b.get("balanceAvailable") or 0),
+                "overdraft": float(b.get("overdraft") or 0),
+                "exposure": float(b.get("unmatchedExposure") or 0),
+            }
+        except Exception as e:
+            print(f"Error fetching wallet balance: {str(e)}")
             return None
 
     def get_orders(self, order_ids=None, market_ids=None):
