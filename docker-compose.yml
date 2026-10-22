@@ -21,6 +21,8 @@ services:
     build: .
     container_name: betdex_dashboard
     restart: "no"
+    env_file:
+      - .env
     command: ["python", "-u", "src/dashboard.py"]
     ports:
       - "8051:8051"
