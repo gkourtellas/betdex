@@ -15,7 +15,10 @@ Pages:
   step frequency and recent bets.
 - `/analytics` — cumulative profit, stake vs profit, profit per strategy and
   profit per league.
-- `/categories` — group the leagues that have appeared on bets into categories.
+- `/categories` — build league categories from every league the bot knows
+  (collected from live markets plus every league that has appeared on a
+  bet), grouped by sport. Strategies can then filter on a category instead
+  of listing leagues one by one.
 - `/strategies` — manage strategies (BetDEX fields: market type, totals,
   staking plan, flashscore, etc.), global risk rules, reset per-strategy state.
 - `/logs` — tail the bot and skipped logs.
